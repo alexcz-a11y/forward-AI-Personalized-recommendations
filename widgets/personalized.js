@@ -227,9 +227,11 @@ function normalizeMediaType(mt) {
 }
 
 function resolveOpenAIConfig(params) {
-  const baseUrl = (params.openaiBaseUrl || "https://api.openai.com/v1")
+  let baseUrl = (params.openaiBaseUrl || "https://api.openai.com/v1")
     .trim()
     .replace(/\/+$/, "");
+  // Defensive: 第三方网关用户常只填 https://xxx.com (漏 /v1), 自动补上避免 404
+  if (!/\/v\d+$/.test(baseUrl)) baseUrl += "/v1";
   const endpoint = params.openaiEndpoint === "chat" ? "chat" : "responses";
   let model = params.openaiModel || "gpt-5.4-mini";
   if (model === "custom") {
@@ -600,7 +602,7 @@ Rules:
         payload.response_format || (payload.text && payload.text.format);
       if (
         jsonFmtPresent &&
-        /response_format|json_object|json_schema|text\.format|unsupported_value/i.test(
+        /response_format|json_object|json_schema|text\.format/i.test(
           errMsg
         )
       ) {
@@ -621,7 +623,7 @@ Rules:
       const reasoningPresent = payload.reasoning_effort || payload.reasoning;
       if (
         reasoningPresent &&
-        /reasoning_effort|reasoning|effort|unsupported_parameter|unsupported_value/i.test(
+        /reasoning_effort|reasoning\.effort|['"]reasoning['"]/i.test(
           errMsg
         )
       ) {
@@ -637,6 +639,8 @@ Rules:
       throw mapHttpError(httpError || { status }, "OpenAI");
     }
 
+    // Defensive — retry loop always either breaks with response or throws;
+    // this catches any unexpected path where response stays undefined.
     if (!response) throw new Error("OpenAI 多次重试仍失败");
 
     const content = extractLLMText(response.data, openaiCfg.endpoint);
