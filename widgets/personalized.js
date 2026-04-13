@@ -12,7 +12,7 @@
 WidgetMetadata = {
   id: "forward.personalized",
   title: "AI 个性化推荐",
-  version: "2.0.0",
+  version: "2.1.0",
   requiredVersion: "0.0.2",
   description: "基于 Trakt 观影历史 + OpenAI 的个性化电影/剧集推荐",
   author: "alexcz-a11y",
@@ -43,14 +43,66 @@ WidgetMetadata = {
       description: "sk- 开头,明文存储,请勿共享",
     },
     {
+      name: "openaiBaseUrl",
+      title: "OpenAI 兼容端点",
+      type: "input",
+      value: "https://api.openai.com/v1",
+      description:
+        "OpenAI 兼容网关 base URL (末尾到 /v1 即可, 代码会自动追加 /responses 或 /chat/completions). 第三方网关请把下方「端点类型」切到 chat",
+    },
+    {
+      name: "openaiEndpoint",
+      title: "端点类型",
+      type: "enumeration",
+      value: "responses",
+      description:
+        "OpenAI 官方保持 responses; OpenRouter / DeepSeek / LiteLLM 等第三方兼容网关几乎只支持 chat",
+      enumOptions: [
+        { title: "Responses API (/v1/responses)", value: "responses" },
+        { title: "Chat Completions (/v1/chat/completions)", value: "chat" },
+      ],
+    },
+    {
       name: "openaiModel",
       title: "OpenAI 模型",
+      type: "enumeration",
+      value: "gpt-5.4-mini",
+      enumOptions: [
+        { title: "GPT-5.4 (推理, 旗舰)", value: "gpt-5.4" },
+        { title: "GPT-5.4 mini (推荐)", value: "gpt-5.4-mini" },
+        { title: "GPT-5.4 nano (最快)", value: "gpt-5.4-nano" },
+        { title: "GPT-5.4 pro (最强推理)", value: "gpt-5.4-pro" },
+        { title: "GPT-5", value: "gpt-5" },
+        { title: "GPT-5 mini", value: "gpt-5-mini" },
+        { title: "GPT-4.1 mini", value: "gpt-4.1-mini" },
+        { title: "GPT-4o mini", value: "gpt-4o-mini" },
+        { title: "GPT-4o", value: "gpt-4o" },
+        { title: "自定义 (使用下方 ID)", value: "custom" },
+      ],
+    },
+    {
+      name: "customOpenaiModel",
+      title: "自定义模型 ID",
       type: "input",
-      value: "gpt-4o-mini",
-      placeholders: [
-        { title: "gpt-4o-mini (推荐)", value: "gpt-4o-mini" },
-        { title: "gpt-4o", value: "gpt-4o" },
-        { title: "gpt-4.1-mini", value: "gpt-4.1-mini" },
+      description:
+        "仅当上方选择「自定义」时生效. 例如 anthropic/claude-sonnet-4.5 / deepseek-chat / qwen/qwen3-max",
+      belongTo: { paramName: "openaiModel", value: ["custom"] },
+    },
+    {
+      name: "reasoningEffort",
+      title: "推理程度",
+      type: "enumeration",
+      value: "default",
+      description:
+        "仅 GPT-5 / GPT-5.4 等推理模型有效, 非推理模型请保持「默认」. 错误会自动重试并剥掉此字段",
+      enumOptions: [
+        { title: "默认 (不指定)", value: "default" },
+        { title: "无 none", value: "none" },
+        { title: "最小 minimal (仅 GPT-5)", value: "minimal" },
+        { title: "低 low", value: "low" },
+        { title: "中 medium", value: "medium" },
+        { title: "高 high", value: "high" },
+        { title: "超高 xhigh (GPT-5.2+)", value: "xhigh" },
       ],
     },
   ],
@@ -172,6 +224,20 @@ function normalizeMediaType(mt) {
   if (mt === "movies" || mt === "movie") return "movie";
   if (mt === "shows" || mt === "show" || mt === "tv") return "tv";
   return mt;
+}
+
+function resolveOpenAIConfig(params) {
+  const baseUrl = (params.openaiBaseUrl || "https://api.openai.com/v1")
+    .trim()
+    .replace(/\/+$/, "");
+  const endpoint = params.openaiEndpoint === "chat" ? "chat" : "responses";
+  let model = params.openaiModel || "gpt-5.4-mini";
+  if (model === "custom") {
+    model = (params.customOpenaiModel || "").trim();
+    if (!model) throw new Error("选择了自定义模型但未填写模型 ID");
+  }
+  const effort = params.reasoningEffort || "default";
+  return { baseUrl, endpoint, model, reasoningEffort: effort };
 }
 
 function mapGenreIdsToNames(ids, mediaType, language) {
@@ -367,13 +433,75 @@ async function fetchTMDBCandidates(apiKey, profile, mediaType, language) {
   });
 }
 
-async function rankWithLLM(openaiKey, model, profile, candidates, n, language) {
+function buildResponsesPayload(cfg, systemPrompt, userContent) {
+  const p = {
+    model: cfg.model,
+    input: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userContent },
+    ],
+    text: { format: { type: "json_object" } },
+  };
+  if (cfg.reasoningEffort && cfg.reasoningEffort !== "default") {
+    p.reasoning = { effort: cfg.reasoningEffort };
+  }
+  return p;
+}
+
+function buildChatPayload(cfg, systemPrompt, userContent) {
+  const p = {
+    model: cfg.model,
+    messages: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userContent },
+    ],
+    response_format: { type: "json_object" },
+  };
+  if (cfg.reasoningEffort && cfg.reasoningEffort !== "default") {
+    p.reasoning_effort = cfg.reasoningEffort;
+  }
+  return p;
+}
+
+function extractLLMText(data, endpoint) {
+  if (!data) return "";
+  if (endpoint === "chat") {
+    return (
+      (data.choices &&
+        data.choices[0] &&
+        data.choices[0].message &&
+        data.choices[0].message.content) ||
+      ""
+    );
+  }
+  // responses API
+  if (typeof data.output_text === "string" && data.output_text) {
+    return data.output_text;
+  }
+  const arr = Array.isArray(data.output) ? data.output : [];
+  for (const item of arr) {
+    if (item && item.type === "message" && Array.isArray(item.content)) {
+      for (const c of item.content) {
+        if (
+          c &&
+          (c.type === "output_text" || c.type === "text") &&
+          typeof c.text === "string"
+        ) {
+          return c.text;
+        }
+      }
+    }
+  }
+  return "";
+}
+
+async function rankWithLLM(openaiKey, openaiCfg, profile, candidates, n, language) {
   const sig =
     profile.topRated.map((r) => r.tmdbId).join(",") +
     "|" +
     candidates.map((c) => c.id).join(",") +
-    `|${model}|${n}|${language}`;
-  const cacheKey = `personalized:llm:v1:${djb2Hash(sig)}`;
+    `|${openaiCfg.baseUrl}|${openaiCfg.endpoint}|${openaiCfg.model}|${openaiCfg.reasoningEffort}|${n}|${language}`;
+  const cacheKey = `personalized:llm:v2:${djb2Hash(sig)}`;
 
   return withCache(cacheKey, 3600, async () => {
     const isZh = language && language.startsWith("zh");
@@ -413,23 +541,17 @@ Rules:
       recentTitles: profile.recentTitles,
     };
 
-    const payload = {
-      model,
-      temperature: 0.4,
-      response_format: { type: "json_object" },
-      messages: [
-        { role: "system", content: systemPrompt },
-        {
-          role: "user",
-          content: JSON.stringify({
-            profile: compactProfile,
-            candidates: compactCandidates,
-            targetCount: n,
-            language,
-          }),
-        },
-      ],
-    };
+    const userContent = JSON.stringify({
+      profile: compactProfile,
+      candidates: compactCandidates,
+      targetCount: n,
+      language,
+    });
+
+    const url =
+      openaiCfg.endpoint === "responses"
+        ? `${openaiCfg.baseUrl}/responses`
+        : `${openaiCfg.baseUrl}/chat/completions`;
     const httpOpts = {
       headers: {
         "Content-Type": "application/json",
@@ -437,40 +559,87 @@ Rules:
       },
     };
 
+    let payload =
+      openaiCfg.endpoint === "responses"
+        ? buildResponsesPayload(openaiCfg, systemPrompt, userContent)
+        : buildChatPayload(openaiCfg, systemPrompt, userContent);
+
     let response;
-    try {
-      response = await Widget.http.post(
-        "https://api.openai.com/v1/chat/completions",
-        payload,
-        httpOpts
-      );
-    } catch (e) {
-      // Some models reject response_format — retry once without it
-      if (/response_format|json_object/i.test((e && e.message) || "")) {
-        const fallback = { ...payload };
-        delete fallback.response_format;
-        response = await Widget.http.post(
-          "https://api.openai.com/v1/chat/completions",
-          fallback,
-          httpOpts
-        );
-      } else {
-        throw mapHttpError(e, "OpenAI");
+    for (let attempt = 0; attempt < 3; attempt++) {
+      let httpError;
+      try {
+        response = await Widget.http.post(url, payload, httpOpts);
+      } catch (e) {
+        httpError = e;
       }
+
+      // Collect status + error message from either thrown error or returned body
+      const status =
+        (httpError &&
+          (httpError.status ||
+            (httpError.response && httpError.response.status))) ||
+        (response && response.status);
+      let errMsg = "";
+      if (httpError) {
+        errMsg = String((httpError && httpError.message) || "");
+      }
+      if (!httpError && status != null && status >= 400) {
+        const bodyErr =
+          response &&
+          response.data &&
+          response.data.error &&
+          (response.data.error.message || response.data.error.code);
+        errMsg = String(bodyErr || `HTTP ${status}`);
+      }
+
+      const failed = httpError || (status != null && status >= 400);
+      if (!failed) break;
+
+      // Level 1: JSON format unsupported
+      const jsonFmtPresent =
+        payload.response_format || (payload.text && payload.text.format);
+      if (
+        jsonFmtPresent &&
+        /response_format|json_object|json_schema|text\.format|unsupported_value/i.test(
+          errMsg
+        )
+      ) {
+        const next = { ...payload };
+        delete next.response_format;
+        if (next.text) {
+          const t = { ...next.text };
+          delete t.format;
+          if (Object.keys(t).length === 0) delete next.text;
+          else next.text = t;
+        }
+        payload = next;
+        response = undefined;
+        continue;
+      }
+
+      // Level 2: reasoning field unsupported
+      const reasoningPresent = payload.reasoning_effort || payload.reasoning;
+      if (
+        reasoningPresent &&
+        /reasoning_effort|reasoning|effort|unsupported_parameter|unsupported_value/i.test(
+          errMsg
+        )
+      ) {
+        const next = { ...payload };
+        delete next.reasoning_effort;
+        delete next.reasoning;
+        payload = next;
+        response = undefined;
+        continue;
+      }
+
+      // Unrecoverable
+      throw mapHttpError(httpError || { status }, "OpenAI");
     }
 
-    const status = response && response.status;
-    if (status != null && status !== 200) {
-      throw mapHttpError({ status }, "OpenAI");
-    }
+    if (!response) throw new Error("OpenAI 多次重试仍失败");
 
-    const content =
-      response &&
-      response.data &&
-      response.data.choices &&
-      response.data.choices[0] &&
-      response.data.choices[0].message &&
-      response.data.choices[0].message.content;
+    const content = extractLLMText(response.data, openaiCfg.endpoint);
     if (!content) throw new Error("OpenAI 返回空内容");
 
     let parsed;
@@ -539,7 +708,6 @@ async function getRecommendations(params = {}) {
   const traktUsername = params.traktUsername || "";
   const tmdbApiKey = params.tmdbApiKey || "";
   const openaiApiKey = params.openaiApiKey || "";
-  const openaiModel = params.openaiModel || "gpt-4o-mini";
   const mediaType = params.mediaType || "mixed";
   const language = params.language || "zh-CN";
   const count = Math.max(
@@ -551,6 +719,8 @@ async function getRecommendations(params = {}) {
   if (!traktUsername) throw new Error("缺少 Trakt 用户名");
   if (!tmdbApiKey) throw new Error("缺少 TMDB API Key");
   if (!openaiApiKey) throw new Error("缺少 OpenAI API Key");
+
+  const openaiCfg = resolveOpenAIConfig(params);
 
   const profile = await fetchTraktProfile(
     traktClientId,
@@ -580,7 +750,7 @@ async function getRecommendations(params = {}) {
   try {
     ranked = await rankWithLLM(
       openaiApiKey,
-      openaiModel,
+      openaiCfg,
       profile,
       candidates,
       count,
