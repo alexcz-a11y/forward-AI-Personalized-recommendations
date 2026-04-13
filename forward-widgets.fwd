@@ -5,9 +5,9 @@
     {
       "id": "forward.personalized",
       "title": "AI 个性化推荐",
-      "description": "基于观影历史和偏好的 AI 个性化电影与剧集推荐",
-      "requiredVersion": "0.0.1",
-      "version": "1.0.0",
+      "description": "基于 Trakt 观影历史 + OpenAI 的个性化电影/剧集推荐",
+      "requiredVersion": "0.0.2",
+      "version": "2.0.0",
       "author": "alexcz-a11y",
       "url": "https://raw.githubusercontent.com/alexcz-a11y/forward-AI-Personalized-recommendations/main/widgets/personalized.js"
     }

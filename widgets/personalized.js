@@ -1,91 +1,604 @@
 /**
- * Forward AI 个性化推荐 Widget
+ * Forward AI 个性化推荐 Widget v2
  *
- * 基于用户的观影历史、偏好和评分,通过后端 AI 服务返回个性化电影与剧集推荐。
- * 后端负责意图理解、特征匹配和 TMDB 数据补全,widget 只负责调用和展示。
+ * 完全 client-side 的个性化推荐:
+ *   Trakt (观影资料) → TMDB (候选池) → OpenAI (LLM 排序) → VideoItem[]
+ *
+ * 用户需在 widget 全局设置里填入 4 把 key:
+ *   traktClientId / traktUsername / tmdbApiKey / openaiApiKey
+ * 运行时仅使用 Widget.http / Widget.storage.
  */
-
-// TODO: 替换为你自己的推荐服务后端地址
-const API_BASE = "https://TODO-your-backend.example.com/v1/recommend";
 
 WidgetMetadata = {
   id: "forward.personalized",
   title: "AI 个性化推荐",
-  version: "1.0.0",
-  requiredVersion: "0.0.1",
-  description: "基于观影历史和偏好的 AI 个性化电影与剧集推荐",
+  version: "2.0.0",
+  requiredVersion: "0.0.2",
+  description: "基于 Trakt 观影历史 + OpenAI 的个性化电影/剧集推荐",
   author: "alexcz-a11y",
   site: "https://github.com/alexcz-a11y/forward-AI-Personalized-recommendations",
+  globalParams: [
+    {
+      name: "traktClientId",
+      title: "Trakt Client ID",
+      type: "input",
+      description: "在 trakt.tv/oauth/applications 创建应用后获得",
+    },
+    {
+      name: "traktUsername",
+      title: "Trakt 用户名",
+      type: "input",
+      description: "公开个人主页的用户名(私有账号无法使用)",
+    },
+    {
+      name: "tmdbApiKey",
+      title: "TMDB API Key",
+      type: "input",
+      description: "themoviedb.org 的 v3 API key",
+    },
+    {
+      name: "openaiApiKey",
+      title: "OpenAI API Key",
+      type: "input",
+      description: "sk- 开头,明文存储,请勿共享",
+    },
+    {
+      name: "openaiModel",
+      title: "OpenAI 模型",
+      type: "input",
+      value: "gpt-4o-mini",
+      placeholders: [
+        { title: "gpt-4o-mini (推荐)", value: "gpt-4o-mini" },
+        { title: "gpt-4o", value: "gpt-4o" },
+        { title: "gpt-4.1-mini", value: "gpt-4.1-mini" },
+      ],
+    },
+  ],
   modules: [
     {
       id: "aiRecommend",
       title: "为你推荐",
-      functionName: "getPersonalizedRecommendations",
+      functionName: "getRecommendations",
       cacheDuration: 1800,
       params: [
         {
-          name: "userId",
-          title: "用户 ID",
-          type: "userId",
+          name: "mediaType",
+          title: "类型",
+          type: "enumeration",
+          value: "mixed",
+          enumOptions: [
+            { title: "混合", value: "mixed" },
+            { title: "电影", value: "movies" },
+            { title: "电视剧", value: "shows" },
+          ],
         },
-        {
-          name: "count",
-          title: "推荐数量",
-          type: "count",
-          value: "10",
-          description: "返回的推荐条目数量(默认 10)",
-        },
-        {
-          name: "language",
-          title: "语言",
-          type: "language",
-          value: "zh-CN",
-        },
+        { name: "count", title: "推荐数量", type: "count", value: "20" },
+        { name: "language", title: "语言", type: "language", value: "zh-CN" },
       ],
     },
   ],
 };
 
-async function getPersonalizedRecommendations(params = {}) {
-  const userId = params.userId || "";
-  const count = parseInt(params.count || "10", 10);
-  const language = params.language || "zh-CN";
+// 硬编码 TMDB genre 表,避免每次跑 /genre/*/list
+const GENRE_TABLES = {
+  movie: {
+    "zh-CN": {
+      28: "动作", 12: "冒险", 16: "动画", 35: "喜剧", 80: "犯罪",
+      99: "纪录片", 18: "剧情", 10751: "家庭", 14: "奇幻", 36: "历史",
+      27: "恐怖", 10402: "音乐", 9648: "悬疑", 10749: "爱情", 878: "科幻",
+      10770: "电视电影", 53: "惊悚", 10752: "战争", 37: "西部",
+    },
+    "en-US": {
+      28: "Action", 12: "Adventure", 16: "Animation", 35: "Comedy",
+      80: "Crime", 99: "Documentary", 18: "Drama", 10751: "Family",
+      14: "Fantasy", 36: "History", 27: "Horror", 10402: "Music",
+      9648: "Mystery", 10749: "Romance", 878: "Sci-Fi", 10770: "TV Movie",
+      53: "Thriller", 10752: "War", 37: "Western",
+    },
+  },
+  tv: {
+    "zh-CN": {
+      10759: "动作冒险", 16: "动画", 35: "喜剧", 80: "犯罪", 99: "纪录片",
+      18: "剧情", 10751: "家庭", 10762: "儿童", 9648: "悬疑", 10763: "新闻",
+      10764: "真人秀", 10765: "科幻奇幻", 10766: "肥皂剧", 10767: "脱口秀",
+      10768: "战争政治", 37: "西部",
+    },
+    "en-US": {
+      10759: "Action & Adventure", 16: "Animation", 35: "Comedy", 80: "Crime",
+      99: "Documentary", 18: "Drama", 10751: "Family", 10762: "Kids",
+      9648: "Mystery", 10763: "News", 10764: "Reality",
+      10765: "Sci-Fi & Fantasy", 10766: "Soap", 10767: "Talk",
+      10768: "War & Politics", 37: "Western",
+    },
+  },
+};
 
-  if (!userId) {
-    throw new Error("缺少用户 ID");
+// Trakt genre slug → TMDB genre id (for both movies and TV)
+const TRAKT_TO_TMDB_GENRE = {
+  movie: {
+    action: 28, adventure: 12, animation: 16, comedy: 35, crime: 80,
+    documentary: 99, drama: 18, family: 10751, fantasy: 14, history: 36,
+    horror: 27, music: 10402, musical: 10402, mystery: 9648, romance: 10749,
+    "science-fiction": 878, "sci-fi": 878, thriller: 53, "tv-movie": 10770,
+    war: 10752, western: 37, "super-hero": 28, suspense: 53,
+  },
+  tv: {
+    action: 10759, adventure: 10759, "action-adventure": 10759, animation: 16,
+    anime: 16, comedy: 35, crime: 80, documentary: 99, drama: 18,
+    family: 10751, kids: 10762, mystery: 9648, news: 10763, reality: 10764,
+    "science-fiction": 10765, "sci-fi": 10765, fantasy: 10765,
+    "sci-fi-fantasy": 10765, soap: 10766, "talk-show": 10767,
+    war: 10768, politics: 10768, "war-politics": 10768, western: 37,
+  },
+};
+
+function djb2Hash(str) {
+  let hash = 5381;
+  for (let i = 0; i < str.length; i++) {
+    hash = ((hash << 5) + hash + str.charCodeAt(i)) | 0;
   }
+  return (hash >>> 0).toString(16);
+}
 
+async function withCache(key, ttlSec, producer) {
   try {
-    const response = await Widget.http.post(
-      API_BASE,
-      { userId, count, language },
-      { headers: { "Content-Type": "application/json" } }
-    );
+    const cached = Widget.storage.get(key);
+    if (cached && cached.expiresAt && cached.expiresAt > Date.now()) {
+      return cached.data;
+    }
+  } catch (e) {
+    // storage miss / corruption — treat as cache miss
+  }
+  const data = await producer();
+  try {
+    Widget.storage.set(key, { data, expiresAt: Date.now() + ttlSec * 1000 });
+  } catch (e) {
+    console.error("[AI推荐] 缓存写入失败:", (e && e.message) || e);
+  }
+  return data;
+}
 
-    const data = response.data;
+async function chunkedParallel(items, chunkSize, fn) {
+  const out = [];
+  for (let i = 0; i < items.length; i += chunkSize) {
+    const chunk = items.slice(i, i + chunkSize);
+    const results = await Promise.all(chunk.map(fn));
+    out.push(...results);
+  }
+  return out;
+}
 
-    if (!data || !data.success) {
-      throw new Error((data && data.message) || "推荐服务返回异常");
+function normalizeMediaType(mt) {
+  if (mt === "movies" || mt === "movie") return "movie";
+  if (mt === "shows" || mt === "show" || mt === "tv") return "tv";
+  return mt;
+}
+
+function mapGenreIdsToNames(ids, mediaType, language) {
+  if (!Array.isArray(ids) || ids.length === 0) return "";
+  const lang = language && language.startsWith("zh") ? "zh-CN" : "en-US";
+  const table = (GENRE_TABLES[mediaType] || GENRE_TABLES.movie)[lang] || {};
+  return ids.map((id) => table[id]).filter(Boolean).join(" · ");
+}
+
+function pickTopTmdbGenreIds(genreCounts, mediaType) {
+  const table = TRAKT_TO_TMDB_GENRE[mediaType] || TRAKT_TO_TMDB_GENRE.movie;
+  const sorted = Object.entries(genreCounts || {}).sort((a, b) => b[1] - a[1]);
+  const result = [];
+  const seen = new Set();
+  for (const [slug] of sorted) {
+    const normalized = String(slug).toLowerCase().replace(/\s+/g, "-");
+    const id = table[normalized];
+    if (id && !seen.has(id)) {
+      result.push(id);
+      seen.add(id);
+      if (result.length >= 2) break;
+    }
+  }
+  return result;
+}
+
+function mapHttpError(err, label) {
+  const status =
+    err && (err.status || (err.response && err.response.status));
+  if (status === 401) return new Error(`${label} 认证失败, 请检查密钥`);
+  if (status === 403) return new Error(`${label} 权限不足 (403)`);
+  if (status === 404) return new Error(`${label} 资源不存在 (404)`);
+  if (status === 429) return new Error(`${label} 请求过于频繁, 请稍后再试`);
+  if (status) return new Error(`${label} 返回 ${status}`);
+  return new Error(`${label} 请求失败: ${(err && err.message) || err}`);
+}
+
+async function fetchTraktProfile(clientId, username, mediaType) {
+  const cacheKey = `personalized:trakt:v1:${username}:${mediaType}`;
+  return withCache(cacheKey, 6 * 3600, async () => {
+    const types =
+      mediaType === "mixed" ? ["movies", "shows"] : [mediaType];
+    const headers = {
+      "Content-Type": "application/json",
+      "trakt-api-version": "2",
+      "trakt-api-key": clientId,
+    };
+
+    const topRated = [];
+    const watchedTmdbIds = [];
+    const genreCounts = {};
+    const recentTitles = [];
+
+    for (const type of types) {
+      const mt = type === "movies" ? "movie" : "tv";
+      const base = `https://api.trakt.tv/users/${encodeURIComponent(username)}`;
+
+      let ratingsRes, watchedRes, historyRes;
+      try {
+        [ratingsRes, watchedRes, historyRes] = await Promise.all([
+          Widget.http.get(`${base}/ratings/${type}?limit=50&extended=full`, { headers }),
+          Widget.http.get(`${base}/watched/${type}?extended=full`, { headers }),
+          Widget.http.get(`${base}/history/${type}?limit=40`, { headers }),
+        ]);
+      } catch (e) {
+        throw mapHttpError(e, "Trakt");
+      }
+
+      const ratings = (ratingsRes && ratingsRes.data) || [];
+      for (const r of ratings) {
+        const item = r.movie || r.show;
+        if (!item || !item.ids || item.ids.tmdb == null) continue;
+        if ((r.rating || 0) >= 7) {
+          topRated.push({
+            tmdbId: item.ids.tmdb,
+            mediaType: mt,
+            title: item.title,
+            year: item.year,
+            genres: Array.isArray(item.genres) ? item.genres : [],
+            rating: r.rating,
+          });
+        }
+        for (const g of item.genres || []) {
+          genreCounts[g] = (genreCounts[g] || 0) + 1;
+        }
+      }
+
+      const watched = (watchedRes && watchedRes.data) || [];
+      for (const w of watched) {
+        const item = w.movie || w.show;
+        if (item && item.ids && item.ids.tmdb != null) {
+          watchedTmdbIds.push(`${mt}.${item.ids.tmdb}`);
+        }
+      }
+
+      const history = (historyRes && historyRes.data) || [];
+      for (const h of history) {
+        const item = h.movie || h.show;
+        if (item && item.title) recentTitles.push(item.title);
+      }
     }
 
-    const items = data.data || [];
+    topRated.sort((a, b) => (b.rating || 0) - (a.rating || 0));
+    return {
+      topRated: topRated.slice(0, 30),
+      watchedTmdbIds,
+      genreCounts,
+      recentTitles: recentTitles.slice(0, 20),
+    };
+  });
+}
 
-    return items.map((item) => ({
-      id: String(item.tmdbId || item.id),
-      type: "tmdb",
-      title: item.title,
-      posterPath: item.posterPath,
-      backdropPath: item.backdropPath,
-      releaseDate: item.releaseDate,
-      mediaType: item.mediaType || "movie",
-      rating: item.rating,
-      genreTitle: Array.isArray(item.genres)
-        ? item.genres.join(", ")
-        : item.genreTitle,
-      description: item.description || item.overview,
+async function fetchTMDBCandidates(apiKey, profile, mediaType, language) {
+  const seedSig = profile.topRated
+    .map((r) => `${r.mediaType}.${r.tmdbId}`)
+    .join(",");
+  const cacheKey = `personalized:tmdb:v1:${djb2Hash(
+    seedSig + ":" + mediaType + ":" + language
+  )}`;
+
+  return withCache(cacheKey, 6 * 3600, async () => {
+    const TMDB = "https://api.themoviedb.org/3";
+    const types =
+      mediaType === "mixed"
+        ? ["movie", "tv"]
+        : [mediaType === "movies" ? "movie" : "tv"];
+    const watchedSet = new Set(profile.watchedTmdbIds || []);
+    const raw = [];
+
+    for (const type of types) {
+      const seeds = profile.topRated
+        .filter((r) => r.mediaType === type)
+        .slice(0, 5);
+
+      if (seeds.length > 0) {
+        const lists = await chunkedParallel(seeds, 5, async (seed) => {
+          try {
+            const res = await Widget.http.get(
+              `${TMDB}/${type}/${seed.tmdbId}/recommendations`,
+              { params: { api_key: apiKey, language, page: 1 } }
+            );
+            return (res && res.data && res.data.results) || [];
+          } catch (e) {
+            console.error(
+              `[AI推荐] TMDB ${type} recommendations ${seed.tmdbId} 失败:`,
+              (e && e.message) || e
+            );
+            return [];
+          }
+        });
+        for (const list of lists) {
+          for (const item of list) raw.push({ ...item, _mt: type });
+        }
+      }
+
+      const topGenreIds = pickTopTmdbGenreIds(profile.genreCounts, type);
+      if (topGenreIds.length > 0) {
+        try {
+          const res = await Widget.http.get(`${TMDB}/discover/${type}`, {
+            params: {
+              api_key: apiKey,
+              language,
+              with_genres: topGenreIds.join(","),
+              sort_by: "popularity.desc",
+              "vote_count.gte": 200,
+              page: 1,
+            },
+          });
+          const results = (res && res.data && res.data.results) || [];
+          for (const item of results) raw.push({ ...item, _mt: type });
+        } catch (e) {
+          console.error(
+            `[AI推荐] TMDB discover ${type} 失败:`,
+            (e && e.message) || e
+          );
+        }
+      }
+    }
+
+    const byKey = {};
+    for (const c of raw) {
+      const key = `${c._mt}.${c.id}`;
+      if (watchedSet.has(key)) continue;
+      if (!byKey[key]) byKey[key] = c;
+    }
+    const deduped = Object.values(byKey);
+    deduped.sort((a, b) => (b.popularity || 0) - (a.popularity || 0));
+    const top60 = deduped.slice(0, 60);
+
+    const candidateById = {};
+    for (const c of top60) candidateById[`${c._mt}.${c.id}`] = c;
+    return { candidates: top60, candidateById };
+  });
+}
+
+async function rankWithLLM(openaiKey, model, profile, candidates, n, language) {
+  const sig =
+    profile.topRated.map((r) => r.tmdbId).join(",") +
+    "|" +
+    candidates.map((c) => c.id).join(",") +
+    `|${model}|${n}|${language}`;
+  const cacheKey = `personalized:llm:v1:${djb2Hash(sig)}`;
+
+  return withCache(cacheKey, 3600, async () => {
+    const isZh = language && language.startsWith("zh");
+    const systemPrompt = isZh
+      ? `你是影视推荐助手. 基于用户的 Trakt 观影资料和候选列表, 从候选中挑选 ${n} 部最契合用户口味的作品, 按契合度降序排列.
+约束:
+1. 只能使用候选列表中已存在的 tmdbId, 禁止编造.
+2. 输出严格为单一 JSON 对象, 不要 Markdown 或多余文本.
+3. 格式: {"recommendations":[{"tmdbId":<number>,"mediaType":"movie"|"tv","reason":"<≤40字 中文>"}]}
+4. reason 需具体说明契合点, 避免空话.`
+      : `You are a film/TV recommender. From the candidate list, pick the ${n} best matches for this user, sorted by fit.
+Rules:
+1. You may ONLY use tmdbIds from the candidates. Never invent.
+2. Output a single raw JSON object. No markdown, no prose.
+3. Schema: {"recommendations":[{"tmdbId":<number>,"mediaType":"movie"|"tv","reason":"<≤40 chars>"}]}
+4. reason must be specific, in ${language}.`;
+
+    const compactCandidates = candidates.map((c) => ({
+      tmdbId: c.id,
+      mediaType: c._mt,
+      title: c.title || c.name,
+      year: (c.release_date || c.first_air_date || "").slice(0, 4),
+      voteAverage: c.vote_average,
+      overview: (c.overview || "").slice(0, 180),
     }));
-  } catch (error) {
-    console.error("[AI推荐] 请求失败:", error.message || error);
-    throw new Error("AI 推荐服务暂时不可用,请稍后再试");
+
+    const compactProfile = {
+      topRated: profile.topRated.map((r) => ({
+        tmdbId: r.tmdbId,
+        mediaType: r.mediaType,
+        title: r.title,
+        year: r.year,
+        rating: r.rating,
+        genres: r.genres,
+      })),
+      genreCounts: profile.genreCounts,
+      recentTitles: profile.recentTitles,
+    };
+
+    const payload = {
+      model,
+      temperature: 0.4,
+      response_format: { type: "json_object" },
+      messages: [
+        { role: "system", content: systemPrompt },
+        {
+          role: "user",
+          content: JSON.stringify({
+            profile: compactProfile,
+            candidates: compactCandidates,
+            targetCount: n,
+            language,
+          }),
+        },
+      ],
+    };
+    const httpOpts = {
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${openaiKey}`,
+      },
+    };
+
+    let response;
+    try {
+      response = await Widget.http.post(
+        "https://api.openai.com/v1/chat/completions",
+        payload,
+        httpOpts
+      );
+    } catch (e) {
+      // Some models reject response_format — retry once without it
+      if (/response_format|json_object/i.test((e && e.message) || "")) {
+        const fallback = { ...payload };
+        delete fallback.response_format;
+        response = await Widget.http.post(
+          "https://api.openai.com/v1/chat/completions",
+          fallback,
+          httpOpts
+        );
+      } else {
+        throw mapHttpError(e, "OpenAI");
+      }
+    }
+
+    const status = response && response.status;
+    if (status != null && status !== 200) {
+      throw mapHttpError({ status }, "OpenAI");
+    }
+
+    const content =
+      response &&
+      response.data &&
+      response.data.choices &&
+      response.data.choices[0] &&
+      response.data.choices[0].message &&
+      response.data.choices[0].message.content;
+    if (!content) throw new Error("OpenAI 返回空内容");
+
+    let parsed;
+    try {
+      parsed = JSON.parse(content);
+    } catch (e) {
+      const match = String(content).match(/\{[\s\S]*\}/);
+      if (!match) throw new Error("OpenAI 输出不是合法 JSON");
+      parsed = JSON.parse(match[0]);
+    }
+
+    const recs = (parsed && parsed.recommendations) || [];
+    return recs.map((r) => ({
+      tmdbId: Number(r.tmdbId),
+      mediaType: normalizeMediaType(r.mediaType),
+      reason: r.reason || "",
+    }));
+  });
+}
+
+function fallbackRank(candidates, n) {
+  const sorted = candidates.slice().sort((a, b) => {
+    const sa = (a.popularity || 0) * 0.6 + (a.vote_average || 0) * 0.4;
+    const sb = (b.popularity || 0) * 0.6 + (b.vote_average || 0) * 0.4;
+    return sb - sa;
+  });
+  return sorted.slice(0, n).map((c) => ({
+    tmdbId: c.id,
+    mediaType: c._mt,
+    reason: "",
+  }));
+}
+
+function formatAsVideoItems(ranked, candidateById, language) {
+  const out = [];
+  for (const r of ranked) {
+    const key = `${r.mediaType}.${r.tmdbId}`;
+    const c = candidateById[key];
+    if (!c) continue;
+    // README.md:184 规范要求 id 前缀形式; trendingmedia.js:107 却用 raw id.
+    // 以 README 为准; 若 Forward 运行时拒绝前缀, 改回 String(r.tmdbId).
+    out.push({
+      id: key,
+      type: "tmdb",
+      title: c.title || c.name || "",
+      posterPath: c.poster_path
+        ? `https://image.tmdb.org/t/p/w500${c.poster_path}`
+        : "",
+      backdropPath: c.backdrop_path
+        ? `https://image.tmdb.org/t/p/w780${c.backdrop_path}`
+        : "",
+      releaseDate: c.release_date || c.first_air_date || "",
+      mediaType: r.mediaType,
+      rating: c.vote_average,
+      genreTitle: mapGenreIdsToNames(c.genre_ids, r.mediaType, language),
+      description: r.reason
+        ? `${r.reason} · ${c.overview || ""}`
+        : c.overview || "",
+    });
   }
+  return out;
+}
+
+async function getRecommendations(params = {}) {
+  const traktClientId = params.traktClientId || "";
+  const traktUsername = params.traktUsername || "";
+  const tmdbApiKey = params.tmdbApiKey || "";
+  const openaiApiKey = params.openaiApiKey || "";
+  const openaiModel = params.openaiModel || "gpt-4o-mini";
+  const mediaType = params.mediaType || "mixed";
+  const language = params.language || "zh-CN";
+  const count = Math.max(
+    5,
+    Math.min(50, parseInt(params.count || "20", 10) || 20)
+  );
+
+  if (!traktClientId) throw new Error("缺少 Trakt Client ID");
+  if (!traktUsername) throw new Error("缺少 Trakt 用户名");
+  if (!tmdbApiKey) throw new Error("缺少 TMDB API Key");
+  if (!openaiApiKey) throw new Error("缺少 OpenAI API Key");
+
+  const profile = await fetchTraktProfile(
+    traktClientId,
+    traktUsername,
+    mediaType
+  );
+
+  if (
+    (profile.topRated || []).length === 0 &&
+    (profile.recentTitles || []).length === 0
+  ) {
+    throw new Error("Trakt 账号暂无观影数据, 请先在 Trakt 标记一些作品");
+  }
+
+  const { candidates, candidateById } = await fetchTMDBCandidates(
+    tmdbApiKey,
+    profile,
+    mediaType,
+    language
+  );
+
+  if (!candidates || candidates.length === 0) {
+    throw new Error("没有找到合适的候选作品");
+  }
+
+  let ranked;
+  try {
+    ranked = await rankWithLLM(
+      openaiApiKey,
+      openaiModel,
+      profile,
+      candidates,
+      count,
+      language
+    );
+    ranked = ranked.filter(
+      (r) => candidateById[`${r.mediaType}.${r.tmdbId}`]
+    );
+    if (ranked.length === 0) {
+      console.error("[AI推荐] LLM 结果全为幻觉, 降级");
+      ranked = fallbackRank(candidates, count);
+    } else {
+      ranked = ranked.slice(0, count);
+    }
+  } catch (e) {
+    console.error("[AI推荐] LLM 失败, 降级:", (e && e.message) || e);
+    ranked = fallbackRank(candidates, count);
+  }
+
+  return formatAsVideoItems(ranked, candidateById, language);
 }
