@@ -12,7 +12,7 @@
 WidgetMetadata = {
   id: "forward.personalized",
   title: "AI 个性化推荐",
-  version: "2.1.0",
+  version: "2.1.1",
   requiredVersion: "0.0.2",
   description: "基于 Trakt 观影历史 + OpenAI 的个性化电影/剧集推荐",
   author: "alexcz-a11y",
@@ -269,7 +269,16 @@ function pickTopTmdbGenreIds(genreCounts, mediaType) {
 function mapHttpError(err, label) {
   const status =
     err && (err.status || (err.response && err.response.status));
-  if (status === 401) return new Error(`${label} 认证失败, 请检查密钥`);
+  // Trakt 文档: 私有账号无 OAuth 好友关系也返 401,
+  // 不止是 Client ID 错误 (apiary docs introduction/users 章节)
+  if (status === 401) {
+    if (label === "Trakt") {
+      return new Error(
+        "Trakt 认证失败 — 检查 Client ID, 或确认该用户名存在且为公开账号"
+      );
+    }
+    return new Error(`${label} 认证失败, 请检查密钥`);
+  }
   if (status === 403) return new Error(`${label} 权限不足 (403)`);
   if (status === 404) return new Error(`${label} 资源不存在 (404)`);
   if (status === 429) return new Error(`${label} 请求过于频繁, 请稍后再试`);
@@ -299,9 +308,11 @@ async function fetchTraktProfile(clientId, username, mediaType) {
 
       let ratingsRes, watchedRes, historyRes;
       try {
+        // watched: 只用 ids.tmdb, minimal info 已包含 ids, 不需 extended=full
+        // (重度用户省数 MB 带宽; 参见 Trakt apiary "Extended Info" 章节)
         [ratingsRes, watchedRes, historyRes] = await Promise.all([
           Widget.http.get(`${base}/ratings/${type}?limit=50&extended=full`, { headers }),
-          Widget.http.get(`${base}/watched/${type}?extended=full`, { headers }),
+          Widget.http.get(`${base}/watched/${type}`, { headers }),
           Widget.http.get(`${base}/history/${type}?limit=40`, { headers }),
         ]);
       } catch (e) {
