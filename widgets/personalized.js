@@ -558,6 +558,7 @@ async function fetchTraktProfile(clientId, username, mediaType) {
     const watchedTmdbIdSet = new Set();
     let rewatchedCount = 0;
     let completedShowsCount = 0;
+    let droppedShowsCount = 0;
     for (const it of itemMap.values()) {
       if (!it.title) continue; // 没有标题说明只有 ids, 无意义, 丢掉
       if (it.lastWatchedAt) {
@@ -578,6 +579,17 @@ async function fetchTraktProfile(clientId, username, mediaType) {
         it.completionPct >= 0.8
       ) {
         completedShowsCount++;
+      }
+      // 弃剧负反馈: 至少 5 集已播 (排除 mini-series), 看了一点就停 (≤20%).
+      // completionPct > 0 排除"加进库还没看"的零完成.
+      if (
+        it.mediaType === "tv" &&
+        it.completionPct != null &&
+        it.completionPct > 0 &&
+        it.completionPct <= 0.2 &&
+        (it.episodesAired || 0) >= 5
+      ) {
+        droppedShowsCount++;
       }
       watchedItems.push(it);
       watchedTmdbIdSet.add(`${it.mediaType}.${it.tmdbId}`);
@@ -608,6 +620,7 @@ async function fetchTraktProfile(clientId, username, mediaType) {
         ratedCount,
         rewatchedCount,
         completedShowsCount,
+        droppedShowsCount,
         watchlistCount: watchlistTmdbIds.length,
         collectionCount: collectionTmdbIdSet.size,
       },
@@ -798,6 +811,23 @@ async function rankWithLLM(openaiKey, openaiCfg, profile, candidates, n, languag
         (b.daysSinceLastWatch == null ? 9999 : b.daysSinceLastWatch)
     )
     .slice(0, 10);
+  // 弃剧负反馈: 看了一两集就停, 用来告诉 LLM 用户排斥哪些题材/基调.
+  // 排除条件: completionPct=0 (加进库还没看) / mini-series (<5 集已播)
+  const droppedShows = watchedItems
+    .filter(
+      (i) =>
+        i.mediaType === "tv" &&
+        i.completionPct != null &&
+        i.completionPct > 0 &&
+        i.completionPct <= 0.2 &&
+        (i.episodesAired || 0) >= 5
+    )
+    .sort(
+      (a, b) =>
+        (a.daysSinceLastWatch == null ? 9999 : a.daysSinceLastWatch) -
+        (b.daysSinceLastWatch == null ? 9999 : b.daysSinceLastWatch)
+    )
+    .slice(0, 8);
 
   const totals = profile.totals || {};
   // sig 拼接顺序:
@@ -809,8 +839,14 @@ async function rankWithLLM(openaiKey, openaiCfg, profile, candidates, n, languag
     .map((x) => `${x.mediaType}.${x.tmdbId}`)
     .sort()
     .join(",");
+  const droppedKeys = droppedShows
+    .map((x) => `${x.mediaType}.${x.tmdbId}`)
+    .sort()
+    .join(",");
   const sig =
     topEngagedKeys +
+    "|" +
+    droppedKeys +
     "|" +
     (totals.totalWatched || 0) +
     "|" +
@@ -818,9 +854,11 @@ async function rankWithLLM(openaiKey, openaiCfg, profile, candidates, n, languag
     "|" +
     (totals.rewatchedCount || 0) +
     "|" +
+    (totals.droppedShowsCount || 0) +
+    "|" +
     candidates.map((c) => `${c._mt}.${c.id}`).join(",") +
     `|${openaiCfg.baseUrl}|${openaiCfg.endpoint}|${openaiCfg.model}|${openaiCfg.reasoningEffort}|${n}|${language}`;
-  const cacheKey = `personalized:llm:v3:${djb2Hash(sig)}`;
+  const cacheKey = `personalized:llm:v4:${djb2Hash(sig)}`;
 
   return withCache(cacheKey, 3600, async () => {
     const isZh = language && language.startsWith("zh");
@@ -831,6 +869,7 @@ async function rankWithLLM(openaiKey, openaiCfg, profile, candidates, n, languag
 - 大多数用户不打分. 高 plays、近期重看(isRewatched=true)、剧集完成度高(completionPct≥0.8) 都是与显式高分等同甚至更强的正向信号.
 - mostEngaged 里同时出现在 topRated/rewatched/completedShows 多个镜头的条目, 权重应当放大.
 - recentlyEngaged 反映当前的口味方向, 优先用它推断"现在想看什么风格".
+- droppedShows 是用户开了头但 ≤20% 就放弃的剧, 通常表明题材/基调/节奏不合口味. 把它们的 genre / 风格当作**负反馈**, 主动避开候选里风格相近的作品.
 - watchlistSample 表达观看意图. 用来推断口味方向, 但绝对不要从候选中推荐与 watchlistSample 中 tmdbId 相同的作品.
 - 结合 genreCounts、年代、基调(暗黑/治愈/快节奏/慢热) 综合判断, 挑选与用户已有偏好相邻但未看过的作品.
 
@@ -845,6 +884,7 @@ How to read the profile:
 - Most users don't rate. Treat HIGH plays, recent rewatches (isRewatched=true), and high series completion (completionPct >= 0.8) as STRONG positive signals — equal to or stronger than explicit ratings.
 - An item appearing in multiple lenses (mostEngaged + rewatched + topRated) should be weighted more.
 - recentlyEngaged reflects the user's CURRENT taste direction — prioritize it for "what they want right now".
+- droppedShows are series the user started but abandoned at <=20% completion — usually a sign the genre / tone / pace doesn't fit. Treat their genres/tone as NEGATIVE signals and actively avoid recommending tonally similar candidates.
 - watchlistSample is intent: it tells you what flavor they want next. Use it to infer direction, but NEVER recommend any candidate whose tmdbId appears in watchlistSample.
 - Cross-reference candidates against the user's genre/era/tone patterns (dark vs cozy, fast vs slow, prestige vs popcorn).
 
@@ -872,6 +912,7 @@ Rules:
         ratedCount: totals.ratedCount || 0,
         rewatchedCount: totals.rewatchedCount || 0,
         completedShowsCount: totals.completedShowsCount || 0,
+        droppedShowsCount: totals.droppedShowsCount || 0,
         watchlistCount: totals.watchlistCount || 0,
       },
       topRated: (profile.ratedItems || []).slice(0, 15).map((r) => ({
@@ -895,6 +936,12 @@ Rules:
       rewatched: rewatched.map((it) => projectItemForPrompt(it)),
       completedShows: completedShows.map((it) =>
         projectItemForPrompt(it, { includeEpisodes: true })
+      ),
+      droppedShows: droppedShows.map((it) =>
+        projectItemForPrompt(it, {
+          includeEpisodes: true,
+          includeGenres: true,
+        })
       ),
       watchlistSample: profile.watchlistSample || [],
       genreCounts: profile.genreCounts,
