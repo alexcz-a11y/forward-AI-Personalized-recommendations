@@ -12,7 +12,7 @@
 WidgetMetadata = {
   id: "forward.personalized",
   title: "AI 个性化推荐",
-  version: "2.1.1",
+  version: "2.2.0",
   requiredVersion: "0.0.2",
   description: "基于 Trakt 观影历史 + OpenAI 的个性化电影/剧集推荐",
   author: "alexcz-a11y",
@@ -266,6 +266,77 @@ function pickTopTmdbGenreIds(genreCounts, mediaType) {
   return result;
 }
 
+// 唯一把多信号塌缩成数字的地方; 仅用于 (a) 给 LLM 选 top-N 时排序,
+// (b) 给 TMDB 选种子. 该分数本身从不写入 LLM payload —— LLM 拿到的是原始字段.
+function engagementScore(item) {
+  const ratingPart =
+    item.rating != null ? (item.rating - 5) * 0.6 : 0; // -3..+3
+  const playsPart =
+    item.plays ? Math.log2(item.plays + 1) * 0.8 : 0; // 1 play≈0.8, 8 plays≈2.5
+  const recencyPart =
+    item.daysSinceLastWatch != null
+      ? Math.max(0, 1 - item.daysSinceLastWatch / 365) * 1.2
+      : 0; // 今天=1.2, 1 年前=0
+  const completionPart =
+    item.completionPct != null ? item.completionPct * 1.0 : 0; // 0..1
+  const intentPart = item.recentEvents30d
+    ? Math.min(item.recentEvents30d, 3) * 0.3
+    : 0;
+  return (
+    ratingPart + playsPart + recencyPart + completionPart + intentPart
+  );
+}
+
+function pickTopEngaged(items, mediaType, max) {
+  const filtered =
+    mediaType && mediaType !== "any"
+      ? items.filter((i) => i.mediaType === mediaType)
+      : items.slice();
+  filtered.sort((a, b) => engagementScore(b) - engagementScore(a));
+  return filtered.slice(0, max);
+}
+
+// 用于挑 TMDB 种子: 不打分的用户也要能跑通, 所以扩展了"被认定为种子"的口径.
+function isEngagedSeed(item) {
+  return (
+    (item.rating || 0) >= 7 ||
+    (item.plays || 0) >= 2 ||
+    (item.completionPct || 0) >= 0.7 ||
+    (item.daysSinceLastWatch != null &&
+      item.daysSinceLastWatch <= 60 &&
+      (item.plays || 0) >= 1)
+  );
+}
+
+function projectItemForPrompt(item, opts) {
+  const out = {
+    tmdbId: item.tmdbId,
+    mediaType: item.mediaType,
+    title: item.title,
+    year: item.year,
+  };
+  if (item.rating != null) out.rating = item.rating;
+  if (item.plays) out.plays = item.plays;
+  if (item.daysSinceLastWatch != null)
+    out.daysSinceLastWatch = item.daysSinceLastWatch;
+  if (item.completionPct != null)
+    out.completionPct = Number(item.completionPct.toFixed(2));
+  if (opts && opts.includeEpisodes) {
+    if (item.episodesWatched != null)
+      out.episodesWatched = item.episodesWatched;
+    if (item.episodesAired != null)
+      out.episodesAired = item.episodesAired;
+  }
+  if (opts && opts.includeGenres && Array.isArray(item.genres))
+    out.genres = item.genres.slice(0, 5);
+  if (opts && opts.includeActions) {
+    if (item.scrobbleCount) out.scrobbleCount = item.scrobbleCount;
+    if (item.checkinCount) out.checkinCount = item.checkinCount;
+  }
+  if (item.isRewatched) out.isRewatched = true;
+  return out;
+}
+
 function mapHttpError(err, label) {
   const status =
     err && (err.status || (err.response && err.response.status));
@@ -287,7 +358,7 @@ function mapHttpError(err, label) {
 }
 
 async function fetchTraktProfile(clientId, username, mediaType) {
-  const cacheKey = `personalized:trakt:v1:${username}:${mediaType}`;
+  const cacheKey = `personalized:trakt:v2:${username}:${mediaType}`;
   return withCache(cacheKey, 6 * 3600, async () => {
     const types =
       mediaType === "mixed" ? ["movies", "shows"] : [mediaType];
@@ -297,93 +368,284 @@ async function fetchTraktProfile(clientId, username, mediaType) {
       "trakt-api-key": clientId,
     };
 
-    const topRated = [];
-    const watchedTmdbIds = [];
-    const genreCounts = {};
+    const itemMap = new Map(); // key=`${mt}.${tmdbId}` → 合并后的条目
+    const ratedItems = [];
+    const watchlistTmdbIdSet = new Set();
+    const watchlistSample = [];
+    const collectionTmdbIdSet = new Set();
+    const history30dTitles = [];
     const recentTitles = [];
+    const genreCounts = {};
+    let ratedCount = 0;
+
+    const now = Date.now();
+    const THIRTY_DAYS_MS = 30 * 86400 * 1000;
+
+    const ensureItem = (mt, tmdbId) => {
+      const key = `${mt}.${tmdbId}`;
+      let it = itemMap.get(key);
+      if (!it) {
+        it = { tmdbId, mediaType: mt };
+        itemMap.set(key, it);
+      }
+      return it;
+    };
 
     for (const type of types) {
       const mt = type === "movies" ? "movie" : "tv";
       const base = `https://api.trakt.tv/users/${encodeURIComponent(username)}`;
 
-      let ratingsRes, watchedRes, historyRes;
+      // 5 端点统一在一个 try 里 funnel 到 mapHttpError, 保住 401 dual-meaning 提示.
+      // chunkedParallel 把并发上限压到 4, 避免 mixed 模式下一次性发 10 个请求.
+      const reqDefs = [
+        {
+          name: "ratings",
+          url: `${base}/ratings/${type}?limit=200&extended=full`,
+        },
+        {
+          name: "watched",
+          // shows 必须 extended=full 才有 aired_episodes 字段
+          url:
+            type === "shows"
+              ? `${base}/watched/shows?extended=full`
+              : `${base}/watched/movies`,
+        },
+        { name: "history", url: `${base}/history/${type}?limit=200` },
+        { name: "watchlist", url: `${base}/watchlist/${type}` },
+        { name: "collection", url: `${base}/collection/${type}` },
+      ];
+
+      let results;
       try {
-        // watched: 只用 ids.tmdb, minimal info 已包含 ids, 不需 extended=full
-        // (重度用户省数 MB 带宽; 参见 Trakt apiary "Extended Info" 章节)
-        [ratingsRes, watchedRes, historyRes] = await Promise.all([
-          Widget.http.get(`${base}/ratings/${type}?limit=50&extended=full`, { headers }),
-          Widget.http.get(`${base}/watched/${type}`, { headers }),
-          Widget.http.get(`${base}/history/${type}?limit=40`, { headers }),
-        ]);
+        results = await chunkedParallel(reqDefs, 4, async (req) => {
+          const res = await Widget.http.get(req.url, { headers });
+          return { name: req.name, data: (res && res.data) || [] };
+        });
       } catch (e) {
         throw mapHttpError(e, "Trakt");
       }
 
-      const ratings = (ratingsRes && ratingsRes.data) || [];
-      for (const r of ratings) {
-        const item = r.movie || r.show;
+      const byName = {};
+      for (const r of results) byName[r.name] = r.data;
+
+      // ---- watched: 提取 plays / lastWatchedAt / 剧集完成度 ----
+      const watched = byName.watched || [];
+      for (const w of watched) {
+        const item = w.movie || w.show;
         if (!item || !item.ids || item.ids.tmdb == null) continue;
-        if ((r.rating || 0) >= 7) {
-          topRated.push({
-            tmdbId: item.ids.tmdb,
-            mediaType: mt,
-            title: item.title,
-            year: item.year,
-            genres: Array.isArray(item.genres) ? item.genres : [],
-            rating: r.rating,
-          });
+        const it = ensureItem(mt, item.ids.tmdb);
+        it.title = item.title;
+        it.year = item.year;
+        it.genres = Array.isArray(item.genres) ? item.genres : [];
+
+        if (mt === "movie") {
+          it.plays = w.plays || 0;
+          it.lastWatchedAt = w.last_watched_at || null;
+        } else {
+          // shows: 累加 seasons[].episodes[]
+          const seasons = Array.isArray(w.seasons) ? w.seasons : [];
+          let epWatched = 0;
+          let totalPlays = 0;
+          let lastEpAt = null;
+          for (const s of seasons) {
+            const eps = Array.isArray(s.episodes) ? s.episodes : [];
+            for (const e of eps) {
+              const p = e.plays || 0;
+              if (p > 0) epWatched++;
+              totalPlays += p;
+              if (
+                e.last_watched_at &&
+                (!lastEpAt || e.last_watched_at > lastEpAt)
+              ) {
+                lastEpAt = e.last_watched_at;
+              }
+            }
+          }
+          it.plays = totalPlays;
+          it.lastWatchedAt = lastEpAt || w.last_watched_at || null;
+          it.episodesWatched = epWatched;
+          // aired_episodes 在 extended=full 时由 show 对象给出; 缺则 null, 防 NaN
+          it.episodesAired =
+            item.aired_episodes != null ? item.aired_episodes : null;
+          it.completionPct = it.episodesAired
+            ? it.episodesWatched / it.episodesAired
+            : null;
         }
+
         for (const g of item.genres || []) {
           genreCounts[g] = (genreCounts[g] || 0) + 1;
         }
       }
 
-      const watched = (watchedRes && watchedRes.data) || [];
-      for (const w of watched) {
-        const item = w.movie || w.show;
-        if (item && item.ids && item.ids.tmdb != null) {
-          watchedTmdbIds.push(`${mt}.${item.ids.tmdb}`);
+      // ---- ratings: attach rating + 仍然喂 legacy 的 topRated lens ----
+      const ratings = byName.ratings || [];
+      for (const r of ratings) {
+        const item = r.movie || r.show;
+        if (!item || !item.ids || item.ids.tmdb == null) continue;
+        const it = ensureItem(mt, item.ids.tmdb);
+        if (!it.title) it.title = item.title;
+        if (!it.year) it.year = item.year;
+        if (!it.genres)
+          it.genres = Array.isArray(item.genres) ? item.genres : [];
+        it.rating = r.rating;
+        it.ratedAt = r.rated_at || null;
+        ratedCount++;
+        if ((r.rating || 0) >= 7) {
+          ratedItems.push({
+            tmdbId: item.ids.tmdb,
+            mediaType: mt,
+            title: item.title,
+            year: item.year,
+            rating: r.rating,
+            genres: Array.isArray(item.genres) ? item.genres : [],
+          });
         }
       }
 
-      const history = (historyRes && historyRes.data) || [];
+      // ---- history: 统计 action 类型 + 30 天内事件数 ----
+      const history = byName.history || [];
       for (const h of history) {
         const item = h.movie || h.show;
-        if (item && item.title) recentTitles.push(item.title);
+        if (!item) continue;
+        if (item.title) recentTitles.push(item.title);
+        if (!item.ids || item.ids.tmdb == null) continue;
+        const it = ensureItem(mt, item.ids.tmdb);
+        if (!it.title) it.title = item.title;
+        if (!it.year) it.year = item.year;
+        const action = h.action;
+        if (action === "scrobble")
+          it.scrobbleCount = (it.scrobbleCount || 0) + 1;
+        else if (action === "checkin")
+          it.checkinCount = (it.checkinCount || 0) + 1;
+        else it.watchCount = (it.watchCount || 0) + 1;
+        const wt = h.watched_at;
+        if (wt) {
+          const t = Date.parse(wt);
+          if (!isNaN(t) && now - t <= THIRTY_DAYS_MS) {
+            it.recentEvents30d = (it.recentEvents30d || 0) + 1;
+            if (item.title) history30dTitles.push(item.title);
+          }
+        }
+      }
+
+      // ---- watchlist: 加入排除集 + 抽样作为 intent lens ----
+      const watchlist = byName.watchlist || [];
+      for (const w of watchlist) {
+        const item = w.movie || w.show;
+        if (!item || !item.ids || item.ids.tmdb == null) continue;
+        watchlistTmdbIdSet.add(`${mt}.${item.ids.tmdb}`);
+        if (watchlistSample.length < 20) {
+          watchlistSample.push({
+            tmdbId: item.ids.tmdb,
+            mediaType: mt,
+            title: item.title,
+            year: item.year,
+          });
+        }
+      }
+
+      // ---- collection: 弱兴趣信号, 仅记录 id ----
+      const collection = byName.collection || [];
+      for (const c of collection) {
+        const item = c.movie || c.show;
+        if (!item || !item.ids || item.ids.tmdb == null) continue;
+        collectionTmdbIdSet.add(`${mt}.${item.ids.tmdb}`);
       }
     }
 
-    topRated.sort((a, b) => (b.rating || 0) - (a.rating || 0));
+    // ---- 收尾: 算 daysSinceLastWatch / isRewatched, 转 array ----
+    const watchedItems = [];
+    const watchedTmdbIdSet = new Set();
+    let rewatchedCount = 0;
+    let completedShowsCount = 0;
+    for (const it of itemMap.values()) {
+      if (!it.title) continue; // 没有标题说明只有 ids, 无意义, 丢掉
+      if (it.lastWatchedAt) {
+        const t = Date.parse(it.lastWatchedAt);
+        it.daysSinceLastWatch = isNaN(t)
+          ? null
+          : Math.max(0, Math.floor((now - t) / 86400000));
+      } else {
+        it.daysSinceLastWatch = null;
+      }
+      if ((it.plays || 0) >= 2) {
+        it.isRewatched = true;
+        rewatchedCount++;
+      }
+      if (
+        it.mediaType === "tv" &&
+        it.completionPct != null &&
+        it.completionPct >= 0.8
+      ) {
+        completedShowsCount++;
+      }
+      watchedItems.push(it);
+      watchedTmdbIdSet.add(`${it.mediaType}.${it.tmdbId}`);
+    }
+
+    const watchedTmdbIds = Array.from(watchedTmdbIdSet);
+    const watchlistTmdbIds = Array.from(watchlistTmdbIdSet);
+    const excludeTmdbIds = Array.from(
+      new Set([...watchedTmdbIds, ...watchlistTmdbIds])
+    );
+
     return {
-      topRated: topRated.slice(0, 30),
-      watchedTmdbIds,
+      watchedItems,
+      ratedItems: ratedItems.sort((a, b) => (b.rating || 0) - (a.rating || 0)),
+      watchlistTmdbIds,
+      watchlistSample,
+      collectionTmdbIds: Array.from(collectionTmdbIdSet),
+      history30dTitles,
+      recentTitles: recentTitles.slice(0, 60),
       genreCounts,
-      recentTitles: recentTitles.slice(0, 20),
+      watchedTmdbIds,
+      excludeTmdbIds,
+      totals: {
+        totalWatched: watchedItems.length,
+        moviesWatched: watchedItems.filter((i) => i.mediaType === "movie")
+          .length,
+        showsWatched: watchedItems.filter((i) => i.mediaType === "tv").length,
+        ratedCount,
+        rewatchedCount,
+        completedShowsCount,
+        watchlistCount: watchlistTmdbIds.length,
+        collectionCount: collectionTmdbIdSet.size,
+      },
     };
   });
 }
 
 async function fetchTMDBCandidates(apiKey, profile, mediaType, language) {
-  const seedSig = profile.topRated
-    .map((r) => `${r.mediaType}.${r.tmdbId}`)
+  const types =
+    mediaType === "mixed"
+      ? ["movie", "tv"]
+      : [mediaType === "movies" ? "movie" : "tv"];
+
+  // 用 isEngagedSeed 扩大种子来源: 不打分的用户也能挑出代表口味的作品.
+  // 同一集合既给 cache sig 用, 又喂给 TMDB recommendations 端点.
+  const seedsByType = {};
+  for (const t of types) {
+    const pool = (profile.watchedItems || []).filter(
+      (i) => i.mediaType === t && isEngagedSeed(i)
+    );
+    pool.sort((a, b) => engagementScore(b) - engagementScore(a));
+    seedsByType[t] = pool.slice(0, 5);
+  }
+  const seedSig = types
+    .flatMap((t) => seedsByType[t].map((s) => `${s.mediaType}.${s.tmdbId}`))
     .join(",");
-  const cacheKey = `personalized:tmdb:v1:${djb2Hash(
+  const cacheKey = `personalized:tmdb:v2:${djb2Hash(
     seedSig + ":" + mediaType + ":" + language
   )}`;
 
   return withCache(cacheKey, 6 * 3600, async () => {
     const TMDB = "https://api.themoviedb.org/3";
-    const types =
-      mediaType === "mixed"
-        ? ["movie", "tv"]
-        : [mediaType === "movies" ? "movie" : "tv"];
-    const watchedSet = new Set(profile.watchedTmdbIds || []);
+    // 排除 watched ∪ watchlist: 心愿单上的作品也不能再被推荐.
+    const excludeSet = new Set(profile.excludeTmdbIds || []);
     const raw = [];
 
     for (const type of types) {
-      const seeds = profile.topRated
-        .filter((r) => r.mediaType === type)
-        .slice(0, 5);
+      const seeds = seedsByType[type] || [];
 
       if (seeds.length > 0) {
         const lists = await chunkedParallel(seeds, 5, async (seed) => {
@@ -433,7 +695,7 @@ async function fetchTMDBCandidates(apiKey, profile, mediaType, language) {
     const byKey = {};
     for (const c of raw) {
       const key = `${c._mt}.${c.id}`;
-      if (watchedSet.has(key)) continue;
+      if (excludeSet.has(key)) continue;
       if (!byKey[key]) byKey[key] = c;
     }
     const deduped = Object.values(byKey);
@@ -509,28 +771,88 @@ function extractLLMText(data, endpoint) {
 }
 
 async function rankWithLLM(openaiKey, openaiCfg, profile, candidates, n, language) {
+  // 派生多镜头数据 (cache sig 和 compactProfile 共享同一份计算).
+  const watchedItems = profile.watchedItems || [];
+  const mostEngaged = pickTopEngaged(watchedItems, "any", 25);
+  const recentlyEngaged = pickTopEngaged(
+    watchedItems.filter(
+      (i) => i.daysSinceLastWatch != null && i.daysSinceLastWatch <= 60
+    ),
+    "any",
+    15
+  );
+  const rewatched = watchedItems
+    .filter((i) => (i.plays || 0) >= 2)
+    .sort((a, b) => (b.plays || 0) - (a.plays || 0))
+    .slice(0, 10);
+  const completedShows = watchedItems
+    .filter(
+      (i) =>
+        i.mediaType === "tv" &&
+        i.completionPct != null &&
+        i.completionPct >= 0.8
+    )
+    .sort(
+      (a, b) =>
+        (a.daysSinceLastWatch == null ? 9999 : a.daysSinceLastWatch) -
+        (b.daysSinceLastWatch == null ? 9999 : b.daysSinceLastWatch)
+    )
+    .slice(0, 10);
+
+  const totals = profile.totals || {};
+  // sig 拼接顺序:
+  //   topEngagedKeys — 反映当前主口味 (排序后稳定)
+  //   total/watchlist/rewatched count — 任一变化都应让缓存失效
+  //   candidates — TMDB 候选池本身的指纹
+  //   openai cfg + n + language — 切模型/语言/数量都要重新跑
+  const topEngagedKeys = mostEngaged
+    .map((x) => `${x.mediaType}.${x.tmdbId}`)
+    .sort()
+    .join(",");
   const sig =
-    profile.topRated.map((r) => r.tmdbId).join(",") +
+    topEngagedKeys +
     "|" +
-    candidates.map((c) => c.id).join(",") +
+    (totals.totalWatched || 0) +
+    "|" +
+    (totals.watchlistCount || 0) +
+    "|" +
+    (totals.rewatchedCount || 0) +
+    "|" +
+    candidates.map((c) => `${c._mt}.${c.id}`).join(",") +
     `|${openaiCfg.baseUrl}|${openaiCfg.endpoint}|${openaiCfg.model}|${openaiCfg.reasoningEffort}|${n}|${language}`;
-  const cacheKey = `personalized:llm:v2:${djb2Hash(sig)}`;
+  const cacheKey = `personalized:llm:v3:${djb2Hash(sig)}`;
 
   return withCache(cacheKey, 3600, async () => {
     const isZh = language && language.startsWith("zh");
     const systemPrompt = isZh
-      ? `你是影视推荐助手. 基于用户的 Trakt 观影资料和候选列表, 从候选中挑选 ${n} 部最契合用户口味的作品, 按契合度降序排列.
+      ? `你是影视推荐助手. 基于用户的 Trakt 观影资料(多镜头数据)和候选列表, 从候选中挑选 ${n} 部最契合用户口味的作品, 按契合度降序排列.
+
+如何理解资料:
+- 大多数用户不打分. 高 plays、近期重看(isRewatched=true)、剧集完成度高(completionPct≥0.8) 都是与显式高分等同甚至更强的正向信号.
+- mostEngaged 里同时出现在 topRated/rewatched/completedShows 多个镜头的条目, 权重应当放大.
+- recentlyEngaged 反映当前的口味方向, 优先用它推断"现在想看什么风格".
+- watchlistSample 表达观看意图. 用来推断口味方向, 但绝对不要从候选中推荐与 watchlistSample 中 tmdbId 相同的作品.
+- 结合 genreCounts、年代、基调(暗黑/治愈/快节奏/慢热) 综合判断, 挑选与用户已有偏好相邻但未看过的作品.
+
 约束:
 1. 只能使用候选列表中已存在的 tmdbId, 禁止编造.
 2. 输出严格为单一 JSON 对象, 不要 Markdown 或多余文本.
 3. 格式: {"recommendations":[{"tmdbId":<number>,"mediaType":"movie"|"tv","reason":"<≤40字 中文>"}]}
-4. reason 需具体说明契合点, 避免空话.`
-      : `You are a film/TV recommender. From the candidate list, pick the ${n} best matches for this user, sorted by fit.
+4. reason 需具体说明契合点(例如"与你重看的XX同导演" / "你完结的XX续作风格"), 避免空话.`
+      : `You are a film/TV recommender. Using the user's multi-lens Trakt profile and the candidate list, pick the ${n} best matches and sort by fit.
+
+How to read the profile:
+- Most users don't rate. Treat HIGH plays, recent rewatches (isRewatched=true), and high series completion (completionPct >= 0.8) as STRONG positive signals — equal to or stronger than explicit ratings.
+- An item appearing in multiple lenses (mostEngaged + rewatched + topRated) should be weighted more.
+- recentlyEngaged reflects the user's CURRENT taste direction — prioritize it for "what they want right now".
+- watchlistSample is intent: it tells you what flavor they want next. Use it to infer direction, but NEVER recommend any candidate whose tmdbId appears in watchlistSample.
+- Cross-reference candidates against the user's genre/era/tone patterns (dark vs cozy, fast vs slow, prestige vs popcorn).
+
 Rules:
 1. You may ONLY use tmdbIds from the candidates. Never invent.
 2. Output a single raw JSON object. No markdown, no prose.
 3. Schema: {"recommendations":[{"tmdbId":<number>,"mediaType":"movie"|"tv","reason":"<≤40 chars>"}]}
-4. reason must be specific, in ${language}.`;
+4. reason must be specific (e.g. "same director as your rewatched X", "tonal match for your completed Y"), in ${language}.`;
 
     const compactCandidates = candidates.map((c) => ({
       tmdbId: c.id,
@@ -541,17 +863,42 @@ Rules:
       overview: (c.overview || "").slice(0, 180),
     }));
 
+    // 多镜头 compactProfile: 同一条目可在多个 list 出现, 重叠是给 LLM 的强信号.
     const compactProfile = {
-      topRated: profile.topRated.map((r) => ({
+      stats: {
+        totalWatched: totals.totalWatched || 0,
+        moviesWatched: totals.moviesWatched || 0,
+        showsWatched: totals.showsWatched || 0,
+        ratedCount: totals.ratedCount || 0,
+        rewatchedCount: totals.rewatchedCount || 0,
+        completedShowsCount: totals.completedShowsCount || 0,
+        watchlistCount: totals.watchlistCount || 0,
+      },
+      topRated: (profile.ratedItems || []).slice(0, 15).map((r) => ({
         tmdbId: r.tmdbId,
         mediaType: r.mediaType,
         title: r.title,
         year: r.year,
         rating: r.rating,
-        genres: r.genres,
+        genres: Array.isArray(r.genres) ? r.genres.slice(0, 5) : undefined,
       })),
+      mostEngaged: mostEngaged.map((it) =>
+        projectItemForPrompt(it, {
+          includeEpisodes: true,
+          includeGenres: true,
+          includeActions: true,
+        })
+      ),
+      recentlyEngaged: recentlyEngaged.map((it) =>
+        projectItemForPrompt(it, { includeEpisodes: true })
+      ),
+      rewatched: rewatched.map((it) => projectItemForPrompt(it)),
+      completedShows: completedShows.map((it) =>
+        projectItemForPrompt(it, { includeEpisodes: true })
+      ),
+      watchlistSample: profile.watchlistSample || [],
       genreCounts: profile.genreCounts,
-      recentTitles: profile.recentTitles,
+      recentTitles: (profile.recentTitles || []).slice(0, 30),
     };
 
     const userContent = JSON.stringify({
@@ -743,8 +1090,9 @@ async function getRecommendations(params = {}) {
     mediaType
   );
 
+  // 重度观众但没打分也算"有数据" — 这是本次 v2.2 的核心目的.
   if (
-    (profile.topRated || []).length === 0 &&
+    (profile.watchedItems || []).length === 0 &&
     (profile.recentTitles || []).length === 0
   ) {
     throw new Error("Trakt 账号暂无观影数据, 请先在 Trakt 标记一些作品");
@@ -783,6 +1131,15 @@ async function getRecommendations(params = {}) {
   } catch (e) {
     console.error("[AI推荐] LLM 失败, 降级:", (e && e.message) || e);
     ranked = fallbackRank(candidates, count);
+  }
+
+  // 兜底: 即便 LLM 不听 prompt, 也绝不让心愿单上的作品出现在结果里.
+  // (候选池阶段已经排除过, 但 LLM 偶尔会把候选 id 张冠李戴)
+  const watchlistSet = new Set(profile.watchlistTmdbIds || []);
+  if (watchlistSet.size > 0) {
+    ranked = ranked.filter(
+      (r) => !watchlistSet.has(`${r.mediaType}.${r.tmdbId}`)
+    );
   }
 
   return formatAsVideoItems(ranked, candidateById, language);
