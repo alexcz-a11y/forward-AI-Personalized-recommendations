@@ -352,9 +352,25 @@ function projectItemForPrompt(item, opts) {
   return out;
 }
 
+// Forward 的 Widget.http 在非 2xx 时可能 throw 一个 Error, 且这个 Error
+// 通常 *只有* message (形如 "Response status code was unacceptable: 409.")
+// 没有挂 status / response.status 字段. 所以我们需要从 message regex 提取
+// 作为兜底. 只识别 4xx/5xx 避免从 title 文本里误抓.
+function extractHttpStatus(errOrRes) {
+  if (!errOrRes || typeof errOrRes !== "object") return null;
+  if (typeof errOrRes.status === "number") return errOrRes.status;
+  if (errOrRes.response && typeof errOrRes.response.status === "number") {
+    return errOrRes.response.status;
+  }
+  if (errOrRes.message) {
+    const m = String(errOrRes.message).match(/\b([45]\d{2})\b/);
+    if (m) return Number(m[1]);
+  }
+  return null;
+}
+
 function mapHttpError(err, label) {
-  const status =
-    err && (err.status || (err.response && err.response.status));
+  const status = extractHttpStatus(err);
   if (status === 401) {
     if (label === "Trakt") {
       // OAuth 模式下 401 只有一种含义: token 被撤销或服务器端失效.
@@ -437,10 +453,7 @@ async function startDeviceFlow() {
   } catch (e) {
     httpErr = e;
   }
-  const status =
-    (httpErr &&
-      (httpErr.status || (httpErr.response && httpErr.response.status))) ||
-    (res && res.status);
+  const status = extractHttpStatus(httpErr) || extractHttpStatus(res);
   if (httpErr || (status != null && status >= 400)) {
     throw mapHttpError(httpErr || { status }, "Trakt");
   }
@@ -463,7 +476,9 @@ async function startDeviceFlow() {
   return newState;
 }
 
-// 轮询 token — 200=成功; 400/429=仍 pending; 404/409/410/418=不可恢复
+// 轮询 token — 成功看 data.access_token (不依赖 status 字段, 因为 Forward 的
+// Widget.http 在某些情况下不暴露 res.status); 400/429=仍 pending; 404/409/
+// 410/418=授权码失效 → 立即重起 device flow 让用户单次刷新就能看到新卡片.
 async function pollDeviceToken(authState) {
   let res;
   let httpErr;
@@ -481,18 +496,11 @@ async function pollDeviceToken(authState) {
   } catch (e) {
     httpErr = e;
   }
-  const status =
-    (httpErr &&
-      (httpErr.status || (httpErr.response && httpErr.response.status))) ||
-    (res && res.status);
 
-  // pending: 用户还没批准, caller 应该继续显示引导卡
-  if (status === 400 || status === 429) return null;
-
-  // 2xx: 拿到 token bundle
-  if (status != null && status >= 200 && status < 300) {
-    const data = (res && res.data) || {};
-    if (!data.access_token) return null; // 空 body, 当 pending 处理
+  // 最可靠的成功判断: data.access_token 存在 → 成功. 绕开 res.status 在
+  // Forward runtime 里可能为 undefined 的边界情况.
+  if (!httpErr && res && res.data && res.data.access_token) {
+    const data = res.data;
     const expiresIn = Number(data.expires_in) || 86400;
     return {
       state: "authorized",
@@ -503,7 +511,15 @@ async function pollDeviceToken(authState) {
     };
   }
 
-  // 404/409/410/418: 授权码已失效, 清空状态让 caller 重新起飞
+  // 其它情况按 status 分类. extractHttpStatus 会从 error.message regex
+  // 匹配 4xx/5xx 作为兜底 (Forward 抛出的 http error 通常只有 message).
+  const status = extractHttpStatus(httpErr) || extractHttpStatus(res);
+
+  // pending: 用户还没批准, caller 应该继续显示引导卡
+  if (status === 400 || status === 429) return null;
+
+  // 404/409/410/418: 授权码失效/过期/已用/被拒. 主动清 state + 立即重起
+  // device flow, 让用户当次刷新就看到新的激活卡片 (否则要刷两次).
   if (
     status === 404 ||
     status === 409 ||
@@ -511,12 +527,11 @@ async function pollDeviceToken(authState) {
     status === 418
   ) {
     traktAuthClear();
-    throw new Error(
-      "Trakt 授权码已失效或被拒绝, 请下次刷新 widget 重新激活"
-    );
+    const freshPending = await startDeviceFlow();
+    throw new DeviceAuthPendingError(freshPending);
   }
 
-  // 其它 不可识别错误透传 (包括 status === null 即纯 throw 路径)
+  // 其它不可识别错误透传
   throw mapHttpError(httpErr || { status }, "Trakt");
 }
 
@@ -540,10 +555,23 @@ async function refreshAccessToken(authState) {
   } catch (e) {
     httpErr = e;
   }
-  const status =
-    (httpErr &&
-      (httpErr.status || (httpErr.response && httpErr.response.status))) ||
-    (res && res.status);
+
+  // 优先直接看 access_token 是否返回, 绕开 res.status 为 undefined 的边界
+  if (!httpErr && res && res.data && res.data.access_token) {
+    const data = res.data;
+    const expiresIn = Number(data.expires_in) || 86400;
+    const next = {
+      state: "authorized",
+      access_token: data.access_token,
+      refresh_token: data.refresh_token || authState.refresh_token,
+      expires_at: Date.now() + expiresIn * 1000,
+      obtained_at: Date.now(),
+    };
+    traktAuthSave(next);
+    return next;
+  }
+
+  const status = extractHttpStatus(httpErr) || extractHttpStatus(res);
 
   if (status === 401) {
     traktAuthClear();
