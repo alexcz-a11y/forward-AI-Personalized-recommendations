@@ -1,35 +1,25 @@
 /**
- * Forward AI 个性化推荐 Widget v2
+ * Forward AI 个性化推荐 Widget v3
  *
  * 完全 client-side 的个性化推荐:
- *   Trakt (观影资料) → TMDB (候选池) → OpenAI (LLM 排序) → VideoItem[]
+ *   Trakt OAuth (/sync/*) → TMDB (候选池) → OpenAI (LLM 排序) → VideoItem[]
  *
- * 用户需在 widget 全局设置里填入 4 把 key:
- *   traktClientId / traktUsername / tmdbApiKey / openaiApiKey
- * 运行时仅使用 Widget.http / Widget.storage.
+ * 用户需在 widget 全局设置里填入 2 把 key:
+ *   tmdbApiKey / openaiApiKey
+ * 首次运行时 widget 会返回一条引导卡片让用户在 trakt.tv/activate
+ * 输入一次性代码完成 Trakt OAuth 授权; token 之后存在 Widget.storage 里
+ * 自动 refresh, 用户不需要再次介入.
  */
 
 WidgetMetadata = {
   id: "forward.personalized",
   title: "AI 个性化推荐",
-  version: "2.2.0",
+  version: "3.0.0",
   requiredVersion: "0.0.2",
   description: "基于 Trakt 观影历史 + OpenAI 的个性化电影/剧集推荐",
   author: "alexcz-a11y",
   site: "https://github.com/alexcz-a11y/forward-AI-Personalized-recommendations",
   globalParams: [
-    {
-      name: "traktClientId",
-      title: "Trakt Client ID",
-      type: "input",
-      description: "在 trakt.tv/oauth/applications 创建应用后获得",
-    },
-    {
-      name: "traktUsername",
-      title: "Trakt 用户名",
-      type: "input",
-      description: "公开个人主页的用户名(私有账号无法使用)",
-    },
     {
       name: "tmdbApiKey",
       title: "TMDB API Key",
@@ -105,6 +95,18 @@ WidgetMetadata = {
         { title: "超高 xhigh (GPT-5.2+)", value: "xhigh" },
       ],
     },
+    {
+      name: "traktResetAuth",
+      title: "重新激活 Trakt",
+      type: "enumeration",
+      value: "false",
+      description:
+        "切换 Trakt 账号时用. 设为「是」并刷新一次 widget 后, 会清空本地 Trakt 授权并返回新的激活卡片. ⚠️ 用完务必改回「否」, 否则每次刷新都会重新要求授权.",
+      enumOptions: [
+        { title: "否", value: "false" },
+        { title: "是 (清空授权)", value: "true" },
+      ],
+    },
   ],
   modules: [
     {
@@ -130,6 +132,19 @@ WidgetMetadata = {
     },
   ],
 };
+
+// Trakt OAuth 常量 ------------------------------------------------------------
+// client_secret 在 Trakt 的 device code flow 模型里被接受暴露在源码中:
+// 该 flow 专为无 redirect URI 的公开客户端设计, 攻击者单独拿到 secret 无法访问
+// 任何用户数据 —— 必须配合每个用户自己在 Widget.storage 里的 refresh_token 才
+// 能换 access_token. 参考 Trakt docs: trakt.docs.apiary.io 的
+// "Authentication - Devices" 章节.
+const TRAKT_BASE = "https://api.trakt.tv";
+const TRAKT_CLIENT_ID =
+  "6742936e1ba42ab5aac9c1bde9e8379664a0783d26228417dd60ef8b318daec1";
+const TRAKT_CLIENT_SECRET =
+  "f0b6076e4b9472fdb6c5c81e83f22927a262c3fb60c012ce7a10c536aef61d4c";
+const TRAKT_APP_NAME = "Forward AI Personalized";
 
 // 硬编码 TMDB genre 表,避免每次跑 /genre/*/list
 const GENRE_TABLES = {
@@ -340,13 +355,16 @@ function projectItemForPrompt(item, opts) {
 function mapHttpError(err, label) {
   const status =
     err && (err.status || (err.response && err.response.status));
-  // Trakt 文档: 私有账号无 OAuth 好友关系也返 401,
-  // 不止是 Client ID 错误 (apiary docs introduction/users 章节)
   if (status === 401) {
     if (label === "Trakt") {
-      return new Error(
-        "Trakt 认证失败 — 检查 Client ID, 或确认该用户名存在且为公开账号"
+      // OAuth 模式下 401 只有一种含义: token 被撤销或服务器端失效.
+      // 挂上 isTrakt401 标志, caller 应该调 traktAuthClear() 让下次刷新
+      // 重新进入 device flow. 本函数维持纯函数语义, 不直接操作 storage.
+      const e = new Error(
+        "Trakt 授权失效, 下次刷新会自动重新激活"
       );
+      e.isTrakt401 = true;
+      return e;
     }
     return new Error(`${label} 认证失败, 请检查密钥`);
   }
@@ -357,16 +375,290 @@ function mapHttpError(err, label) {
   return new Error(`${label} 请求失败: ${(err && err.message) || err}`);
 }
 
-async function fetchTraktProfile(clientId, username, mediaType) {
-  const cacheKey = `personalized:trakt:v2:${username}:${mediaType}`;
+// ============================================================================
+// Trakt OAuth — Device Code Flow 状态机 + token 持久化
+// ============================================================================
+
+// 作为控制流用的 typed error: getRecommendations 里用 instanceof 捕获,
+// 转成引导 VideoItem 返给用户; 不是真正的错误, 不应走错误日志路径.
+class DeviceAuthPendingError extends Error {
+  constructor(authState) {
+    super("device_pending");
+    this.name = "DeviceAuthPendingError";
+    this.authState = authState;
+  }
+}
+
+const TRAKT_AUTH_STORAGE_KEY = "personalized:trakt:auth:v1";
+const TRAKT_CLIENT_ID_HASH = djb2Hash(TRAKT_CLIENT_ID);
+
+function traktAuthLoad() {
+  let raw;
+  try {
+    raw = Widget.storage.get(TRAKT_AUTH_STORAGE_KEY);
+  } catch (e) {
+    return { state: "uninit" };
+  }
+  if (!raw || typeof raw !== "object" || typeof raw.state !== "string") {
+    return { state: "uninit" };
+  }
+  // client_id 变了 → 老 token 整体作废
+  if (raw.client_id_hash && raw.client_id_hash !== TRAKT_CLIENT_ID_HASH) {
+    return { state: "uninit" };
+  }
+  return raw;
+}
+
+function traktAuthSave(state) {
+  try {
+    Widget.storage.set(TRAKT_AUTH_STORAGE_KEY, {
+      ...state,
+      client_id_hash: TRAKT_CLIENT_ID_HASH,
+    });
+  } catch (e) {
+    console.error("[AI推荐] Trakt auth 持久化失败:", (e && e.message) || e);
+  }
+}
+
+function traktAuthClear() {
+  traktAuthSave({ state: "uninit" });
+}
+
+// Device Code Flow 起飞 — POST /oauth/device/code, 把 pending state 存下来
+async function startDeviceFlow() {
+  let res;
+  let httpErr;
+  try {
+    res = await Widget.http.post(
+      `${TRAKT_BASE}/oauth/device/code`,
+      { client_id: TRAKT_CLIENT_ID },
+      { headers: { "Content-Type": "application/json" } }
+    );
+  } catch (e) {
+    httpErr = e;
+  }
+  const status =
+    (httpErr &&
+      (httpErr.status || (httpErr.response && httpErr.response.status))) ||
+    (res && res.status);
+  if (httpErr || (status != null && status >= 400)) {
+    throw mapHttpError(httpErr || { status }, "Trakt");
+  }
+  const data = (res && res.data) || {};
+  if (!data.device_code || !data.user_code) {
+    throw new Error("Trakt device flow 返回异常, 请稍后重试");
+  }
+  const newState = {
+    state: "device_pending",
+    device_code: data.device_code,
+    user_code: data.user_code,
+    // Trakt 返回的字段名是 verification_url (单数 url), RFC 8628 偏离,
+    // 且不提供 verification_uri_complete, 用户必须在浏览器手动输入 user_code.
+    verification_url: data.verification_url || "https://trakt.tv/activate",
+    device_expires_at:
+      Date.now() + (Number(data.expires_in) || 600) * 1000,
+    device_interval: Number(data.interval) || 5,
+  };
+  traktAuthSave(newState);
+  return newState;
+}
+
+// 轮询 token — 200=成功; 400/429=仍 pending; 404/409/410/418=不可恢复
+async function pollDeviceToken(authState) {
+  let res;
+  let httpErr;
+  try {
+    res = await Widget.http.post(
+      `${TRAKT_BASE}/oauth/device/token`,
+      {
+        // ⚠️ Trakt 偏离 RFC 8628: body 字段是 "code" 不是 "device_code"
+        code: authState.device_code,
+        client_id: TRAKT_CLIENT_ID,
+        client_secret: TRAKT_CLIENT_SECRET,
+      },
+      { headers: { "Content-Type": "application/json" } }
+    );
+  } catch (e) {
+    httpErr = e;
+  }
+  const status =
+    (httpErr &&
+      (httpErr.status || (httpErr.response && httpErr.response.status))) ||
+    (res && res.status);
+
+  // pending: 用户还没批准, caller 应该继续显示引导卡
+  if (status === 400 || status === 429) return null;
+
+  // 2xx: 拿到 token bundle
+  if (status != null && status >= 200 && status < 300) {
+    const data = (res && res.data) || {};
+    if (!data.access_token) return null; // 空 body, 当 pending 处理
+    const expiresIn = Number(data.expires_in) || 86400;
+    return {
+      state: "authorized",
+      access_token: data.access_token,
+      refresh_token: data.refresh_token,
+      expires_at: Date.now() + expiresIn * 1000,
+      obtained_at: Date.now(),
+    };
+  }
+
+  // 404/409/410/418: 授权码已失效, 清空状态让 caller 重新起飞
+  if (
+    status === 404 ||
+    status === 409 ||
+    status === 410 ||
+    status === 418
+  ) {
+    traktAuthClear();
+    throw new Error(
+      "Trakt 授权码已失效或被拒绝, 请下次刷新 widget 重新激活"
+    );
+  }
+
+  // 其它 不可识别错误透传 (包括 status === null 即纯 throw 路径)
+  throw mapHttpError(httpErr || { status }, "Trakt");
+}
+
+// access_token 临近过期时刷新 — 只有 401/invalid_grant 才清 state,
+// 其它错误透传 (网络故障 / Trakt 暂时性 5xx, 不要当作永久失效)
+async function refreshAccessToken(authState) {
+  let res;
+  let httpErr;
+  try {
+    res = await Widget.http.post(
+      `${TRAKT_BASE}/oauth/token`,
+      {
+        refresh_token: authState.refresh_token,
+        client_id: TRAKT_CLIENT_ID,
+        client_secret: TRAKT_CLIENT_SECRET,
+        grant_type: "refresh_token",
+        redirect_uri: "urn:ietf:wg:oauth:2.0:oob",
+      },
+      { headers: { "Content-Type": "application/json" } }
+    );
+  } catch (e) {
+    httpErr = e;
+  }
+  const status =
+    (httpErr &&
+      (httpErr.status || (httpErr.response && httpErr.response.status))) ||
+    (res && res.status);
+
+  if (status === 401) {
+    traktAuthClear();
+    throw new Error(
+      "Trakt 授权失效, 请重新激活 (下次刷新 widget 会出现激活卡片)"
+    );
+  }
+
+  if (httpErr || (status != null && status >= 400)) {
+    throw mapHttpError(httpErr || { status }, "Trakt");
+  }
+
+  const data = (res && res.data) || {};
+  if (!data.access_token) {
+    throw new Error("Trakt 刷新 token 返回空");
+  }
+  const expiresIn = Number(data.expires_in) || 86400;
+  const next = {
+    state: "authorized",
+    access_token: data.access_token,
+    refresh_token: data.refresh_token || authState.refresh_token,
+    expires_at: Date.now() + expiresIn * 1000,
+    obtained_at: Date.now(),
+  };
+  traktAuthSave(next);
+  return next;
+}
+
+// 入口: 保证调用方能拿到一个有效 access_token, 否则抛 DeviceAuthPendingError
+async function ensureValidToken() {
+  const auth = traktAuthLoad();
+
+  // uninit → 起飞 device flow, 返回 pending
+  if (auth.state === "uninit") {
+    const pending = await startDeviceFlow();
+    throw new DeviceAuthPendingError(pending);
+  }
+
+  // device_pending → 检查超时, 否则轮询
+  if (auth.state === "device_pending") {
+    if (!auth.device_expires_at || auth.device_expires_at < Date.now()) {
+      // device_code 过期, 清掉重新起飞
+      traktAuthClear();
+      const pending = await startDeviceFlow();
+      throw new DeviceAuthPendingError(pending);
+    }
+    const tokens = await pollDeviceToken(auth);
+    if (!tokens) {
+      // 仍在 pending, 返回同一张卡
+      throw new DeviceAuthPendingError(auth);
+    }
+    traktAuthSave(tokens);
+    return tokens.access_token;
+  }
+
+  // authorized → 检查 access_token 是否快过期, 必要时 refresh
+  if (auth.state === "authorized") {
+    if (!auth.access_token || !auth.expires_at) {
+      traktAuthClear();
+      return ensureValidToken();
+    }
+    if (auth.expires_at - 60000 < Date.now()) {
+      if (!auth.refresh_token) {
+        traktAuthClear();
+        return ensureValidToken();
+      }
+      const next = await refreshAccessToken(auth);
+      return next.access_token;
+    }
+    return auth.access_token;
+  }
+
+  // 未知 state, 安全兜底
+  traktAuthClear();
+  return ensureValidToken();
+}
+
+function traktHeaders(accessToken) {
+  return {
+    "Content-Type": "application/json",
+    "trakt-api-version": "2",
+    "trakt-api-key": TRAKT_CLIENT_ID,
+    Authorization: `Bearer ${accessToken}`,
+  };
+}
+
+function buildPendingVideoItem(authState) {
+  const code = authState.user_code || "";
+  const url = authState.verification_url || "https://trakt.tv/activate";
+  return [
+    {
+      id: url, // type: "url" 时 id 必须是 url 本身
+      type: "url",
+      title: "🔐 请先激活 Trakt 账号",
+      description:
+        `授权码: ${code}\n\n` +
+        "步骤:\n" +
+        `1. 在浏览器打开 ${url}\n` +
+        `2. 登录 Trakt, 输入上面的 8 位代码\n` +
+        `3. 批准 ${TRAKT_APP_NAME} 的访问\n` +
+        "4. 回到 Forward, 下拉刷新这个 widget 即可开始使用\n\n" +
+        "提示: 授权码 10 分钟内有效, 超时需重新刷新.",
+      link: url,
+      posterPath: "",
+      backdropPath: "",
+    },
+  ];
+}
+
+async function fetchTraktProfile(accessToken, mediaType, userHash) {
+  const cacheKey = `personalized:trakt:v3:${userHash}:${mediaType}`;
   return withCache(cacheKey, 6 * 3600, async () => {
     const types =
       mediaType === "mixed" ? ["movies", "shows"] : [mediaType];
-    const headers = {
-      "Content-Type": "application/json",
-      "trakt-api-version": "2",
-      "trakt-api-key": clientId,
-    };
+    const headers = traktHeaders(accessToken);
 
     const itemMap = new Map(); // key=`${mt}.${tmdbId}` → 合并后的条目
     const ratedItems = [];
@@ -393,26 +685,25 @@ async function fetchTraktProfile(clientId, username, mediaType) {
 
     for (const type of types) {
       const mt = type === "movies" ? "movie" : "tv";
-      const base = `https://api.trakt.tv/users/${encodeURIComponent(username)}`;
 
-      // 5 端点统一在一个 try 里 funnel 到 mapHttpError, 保住 401 dual-meaning 提示.
+      // OAuth /sync/* endpoints — 字段和公开 /users/{u}/* 完全一致, 只换路径.
       // chunkedParallel 把并发上限压到 4, 避免 mixed 模式下一次性发 10 个请求.
       const reqDefs = [
         {
           name: "ratings",
-          url: `${base}/ratings/${type}?limit=200&extended=full`,
+          url: `${TRAKT_BASE}/sync/ratings/${type}?limit=200&extended=full`,
         },
         {
           name: "watched",
           // shows 必须 extended=full 才有 aired_episodes 字段
           url:
             type === "shows"
-              ? `${base}/watched/shows?extended=full`
-              : `${base}/watched/movies`,
+              ? `${TRAKT_BASE}/sync/watched/shows?extended=full`
+              : `${TRAKT_BASE}/sync/watched/movies`,
         },
-        { name: "history", url: `${base}/history/${type}?limit=200` },
-        { name: "watchlist", url: `${base}/watchlist/${type}` },
-        { name: "collection", url: `${base}/collection/${type}` },
+        { name: "history", url: `${TRAKT_BASE}/sync/history/${type}?limit=200` },
+        { name: "watchlist", url: `${TRAKT_BASE}/sync/watchlist/${type}` },
+        { name: "collection", url: `${TRAKT_BASE}/sync/collection/${type}` },
       ];
 
       let results;
@@ -422,7 +713,10 @@ async function fetchTraktProfile(clientId, username, mediaType) {
           return { name: req.name, data: (res && res.data) || [] };
         });
       } catch (e) {
-        throw mapHttpError(e, "Trakt");
+        const mapped = mapHttpError(e, "Trakt");
+        // 401 → token 失效, 清 auth 让下次刷新重走 device flow
+        if (mapped.isTrakt401) traktAuthClear();
+        throw mapped;
       }
 
       const byName = {};
@@ -628,6 +922,99 @@ async function fetchTraktProfile(clientId, username, mediaType) {
   });
 }
 
+// ============================================================================
+// /sync/playback — OAuth 新解锁的播放进度数据, 派生电影"半途弃"负反馈和
+// "正在看"正向意图信号. 单次请求抓全部 (movies + episodes), 缓存 1h.
+// ============================================================================
+async function fetchPlaybackSignals(accessToken, userHash) {
+  const cacheKey = `personalized:trakt-playback:v1:${userHash}`;
+  return withCache(cacheKey, 3600, async () => {
+    let res;
+    try {
+      res = await Widget.http.get(
+        `${TRAKT_BASE}/sync/playback?extended=full`,
+        { headers: traktHeaders(accessToken) }
+      );
+    } catch (e) {
+      const mapped = mapHttpError(e, "Trakt");
+      if (mapped.isTrakt401) traktAuthClear();
+      throw mapped;
+    }
+
+    const items = (res && res.data) || [];
+    const now = Date.now();
+
+    const abandonedMovies = [];
+    const inProgressMovies = [];
+    const inProgressShowsMap = new Map(); // 按 show tmdbId 去重, 保留最近暂停的
+
+    for (const it of items) {
+      const isMovie = !!it.movie;
+      const isEpisode = !!it.show && !!it.episode;
+      if (!isMovie && !isEpisode) continue;
+
+      const tmdbId = isMovie
+        ? it.movie && it.movie.ids && it.movie.ids.tmdb
+        : it.show && it.show.ids && it.show.ids.tmdb;
+      if (tmdbId == null) continue;
+
+      const progress = Number(it.progress) || 0;
+      const pausedAtMs = it.paused_at ? Date.parse(it.paused_at) : NaN;
+      if (isNaN(pausedAtMs)) continue;
+      const pausedDaysAgo = (now - pausedAtMs) / 86400000;
+
+      if (isMovie) {
+        const projection = {
+          tmdbId,
+          mediaType: "movie",
+          title: it.movie.title,
+          year: it.movie.year,
+          progress: Math.round(progress * 10) / 10,
+          pausedDaysAgo: Math.round(pausedDaysAgo),
+        };
+        if (progress >= 10 && progress <= 80 && pausedDaysAgo >= 14) {
+          // 14 天没回来的半途电影 — 强负反馈
+          abandonedMovies.push(projection);
+        } else if (pausedDaysAgo < 14) {
+          // 14 天内在看的电影 — 当前意图
+          inProgressMovies.push(projection);
+        }
+        // 夹在中间 (pausedDaysAgo < 14 但已看完 80%+) 的情况, 既非 abandon 也非 inProgress, 忽略
+      } else {
+        // episode: 按 show tmdbId 去重, 只保留最近暂停的那一集
+        if (pausedDaysAgo >= 14) continue; // 老的追剧记录不当强正向信号
+        const showKey = `tv.${tmdbId}`;
+        const existing = inProgressShowsMap.get(showKey);
+        const projection = {
+          tmdbId,
+          mediaType: "tv",
+          title: it.show.title,
+          year: it.show.year,
+          progress: Math.round(progress * 10) / 10,
+          pausedDaysAgo: Math.round(pausedDaysAgo),
+          season: it.episode.season,
+          episode: it.episode.number,
+        };
+        if (!existing || projection.pausedDaysAgo < existing.pausedDaysAgo) {
+          inProgressShowsMap.set(showKey, projection);
+        }
+      }
+    }
+
+    abandonedMovies.sort((a, b) => b.pausedDaysAgo - a.pausedDaysAgo);
+    inProgressMovies.sort((a, b) => a.pausedDaysAgo - b.pausedDaysAgo);
+    const inProgressShows = Array.from(inProgressShowsMap.values()).sort(
+      (a, b) => a.pausedDaysAgo - b.pausedDaysAgo
+    );
+
+    return {
+      abandonedMovies: abandonedMovies.slice(0, 10),
+      inProgressMovies: inProgressMovies.slice(0, 10),
+      inProgressShows: inProgressShows.slice(0, 10),
+    };
+  });
+}
+
 async function fetchTMDBCandidates(apiKey, profile, mediaType, language) {
   const types =
     mediaType === "mixed"
@@ -783,7 +1170,7 @@ function extractLLMText(data, endpoint) {
   return "";
 }
 
-async function rankWithLLM(openaiKey, openaiCfg, profile, candidates, n, language) {
+async function rankWithLLM(openaiKey, openaiCfg, profile, playbackSignals, candidates, n, language) {
   // 派生多镜头数据 (cache sig 和 compactProfile 共享同一份计算).
   const watchedItems = profile.watchedItems || [];
   const mostEngaged = pickTopEngaged(watchedItems, "any", 25);
@@ -830,9 +1217,16 @@ async function rankWithLLM(openaiKey, openaiCfg, profile, candidates, n, languag
     .slice(0, 8);
 
   const totals = profile.totals || {};
+  const pbSignals = playbackSignals || {};
+  const abandonedMovies = pbSignals.abandonedMovies || [];
+  const inProgressMovies = pbSignals.inProgressMovies || [];
+  const inProgressShows = pbSignals.inProgressShows || [];
+
   // sig 拼接顺序:
   //   topEngagedKeys — 反映当前主口味 (排序后稳定)
-  //   total/watchlist/rewatched count — 任一变化都应让缓存失效
+  //   droppedKeys / abandonedKeys — 负反馈指纹
+  //   inProgress* — 当前意图指纹 (排序后稳定, 防止 pausedDaysAgo 抖动导致缓存频繁 miss)
+  //   total/watchlist/rewatched/dropped count — 任一变化都应让缓存失效
   //   candidates — TMDB 候选池本身的指纹
   //   openai cfg + n + language — 切模型/语言/数量都要重新跑
   const topEngagedKeys = mostEngaged
@@ -843,10 +1237,28 @@ async function rankWithLLM(openaiKey, openaiCfg, profile, candidates, n, languag
     .map((x) => `${x.mediaType}.${x.tmdbId}`)
     .sort()
     .join(",");
+  const abandonedMovieKeys = abandonedMovies
+    .map((x) => `movie.${x.tmdbId}`)
+    .sort()
+    .join(",");
+  const inProgressMovieKeys = inProgressMovies
+    .map((x) => `movie.${x.tmdbId}`)
+    .sort()
+    .join(",");
+  const inProgressShowKeys = inProgressShows
+    .map((x) => `tv.${x.tmdbId}`)
+    .sort()
+    .join(",");
   const sig =
     topEngagedKeys +
     "|" +
     droppedKeys +
+    "|" +
+    abandonedMovieKeys +
+    "|" +
+    inProgressMovieKeys +
+    "|" +
+    inProgressShowKeys +
     "|" +
     (totals.totalWatched || 0) +
     "|" +
@@ -858,7 +1270,7 @@ async function rankWithLLM(openaiKey, openaiCfg, profile, candidates, n, languag
     "|" +
     candidates.map((c) => `${c._mt}.${c.id}`).join(",") +
     `|${openaiCfg.baseUrl}|${openaiCfg.endpoint}|${openaiCfg.model}|${openaiCfg.reasoningEffort}|${n}|${language}`;
-  const cacheKey = `personalized:llm:v4:${djb2Hash(sig)}`;
+  const cacheKey = `personalized:llm:v5:${djb2Hash(sig)}`;
 
   return withCache(cacheKey, 3600, async () => {
     const isZh = language && language.startsWith("zh");
@@ -870,6 +1282,8 @@ async function rankWithLLM(openaiKey, openaiCfg, profile, candidates, n, languag
 - mostEngaged 里同时出现在 topRated/rewatched/completedShows 多个镜头的条目, 权重应当放大.
 - recentlyEngaged 反映当前的口味方向, 优先用它推断"现在想看什么风格".
 - droppedShows 是用户开了头但 ≤20% 就放弃的剧, 通常表明题材/基调/节奏不合口味. 把它们的 genre / 风格当作**负反馈**, 主动避开候选里风格相近的作品.
+- abandonedMovies 是用户开始看 (10–80% 进度) 但 14 天以上没回来的电影, 视同 droppedShows 的电影版, 作为**负反馈**, 主动避开同类基调.
+- inProgressMovies / inProgressShows 是用户过去 14 天正在看的, 强烈的**正向意图**信号, 用来推断"现在想看什么", 优先考虑与它们基调/节奏相近的候选.
 - watchlistSample 表达观看意图. 用来推断口味方向, 但绝对不要从候选中推荐与 watchlistSample 中 tmdbId 相同的作品.
 - 结合 genreCounts、年代、基调(暗黑/治愈/快节奏/慢热) 综合判断, 挑选与用户已有偏好相邻但未看过的作品.
 
@@ -885,6 +1299,8 @@ How to read the profile:
 - An item appearing in multiple lenses (mostEngaged + rewatched + topRated) should be weighted more.
 - recentlyEngaged reflects the user's CURRENT taste direction — prioritize it for "what they want right now".
 - droppedShows are series the user started but abandoned at <=20% completion — usually a sign the genre / tone / pace doesn't fit. Treat their genres/tone as NEGATIVE signals and actively avoid recommending tonally similar candidates.
+- abandonedMovies are movies the user started (10–80% in) but hasn't returned to in 14+ days. Treat their genres/tone as NEGATIVE signals, like droppedShows for TV.
+- inProgressMovies / inProgressShows are items the user is actively watching (paused within 14 days). STRONG positive intent — lean into tonally similar candidates.
 - watchlistSample is intent: it tells you what flavor they want next. Use it to infer direction, but NEVER recommend any candidate whose tmdbId appears in watchlistSample.
 - Cross-reference candidates against the user's genre/era/tone patterns (dark vs cozy, fast vs slow, prestige vs popcorn).
 
@@ -914,6 +1330,9 @@ Rules:
         completedShowsCount: totals.completedShowsCount || 0,
         droppedShowsCount: totals.droppedShowsCount || 0,
         watchlistCount: totals.watchlistCount || 0,
+        abandonedMoviesCount: abandonedMovies.length,
+        inProgressMoviesCount: inProgressMovies.length,
+        inProgressShowsCount: inProgressShows.length,
       },
       topRated: (profile.ratedItems || []).slice(0, 15).map((r) => ({
         tmdbId: r.tmdbId,
@@ -943,6 +1362,9 @@ Rules:
           includeGenres: true,
         })
       ),
+      abandonedMovies,
+      inProgressMovies,
+      inProgressShows,
       watchlistSample: profile.watchlistSample || [],
       genreCounts: profile.genreCounts,
       recentTitles: (profile.recentTitles || []).slice(0, 30),
@@ -1113,8 +1535,6 @@ function formatAsVideoItems(ranked, candidateById, language) {
 }
 
 async function getRecommendations(params = {}) {
-  const traktClientId = params.traktClientId || "";
-  const traktUsername = params.traktUsername || "";
   const tmdbApiKey = params.tmdbApiKey || "";
   const openaiApiKey = params.openaiApiKey || "";
   const mediaType = params.mediaType || "mixed";
@@ -1124,20 +1544,43 @@ async function getRecommendations(params = {}) {
     Math.min(50, parseInt(params.count || "20", 10) || 20)
   );
 
-  if (!traktClientId) throw new Error("缺少 Trakt Client ID");
-  if (!traktUsername) throw new Error("缺少 Trakt 用户名");
   if (!tmdbApiKey) throw new Error("缺少 TMDB API Key");
   if (!openaiApiKey) throw new Error("缺少 OpenAI API Key");
 
+  // 用户切换 Trakt 账号时手动触发: 清空当前授权然后重走 device flow.
+  if (params.traktResetAuth === "true") traktAuthClear();
+
   const openaiCfg = resolveOpenAIConfig(params);
 
-  const profile = await fetchTraktProfile(
-    traktClientId,
-    traktUsername,
-    mediaType
-  );
+  // 1. OAuth — 拿到可用 access_token 或返回引导卡片
+  let accessToken;
+  let userHash;
+  try {
+    accessToken = await ensureValidToken();
+    // userHash 只用作 cache key 区分用户, 不需要真实 trakt id.
+    // 省去一次 /users/me 请求, 碰撞概率天文数字级低.
+    userHash = djb2Hash(accessToken.slice(0, 12));
+  } catch (e) {
+    if (e instanceof DeviceAuthPendingError) {
+      return buildPendingVideoItem(e.authState);
+    }
+    throw e;
+  }
 
-  // 重度观众但没打分也算"有数据" — 这是本次 v2.2 的核心目的.
+  // 2. Trakt 数据 — profile (慢, 6h cache) + playback (快, 1h cache) 并行
+  let profile, playbackSignals;
+  try {
+    [profile, playbackSignals] = await Promise.all([
+      fetchTraktProfile(accessToken, mediaType, userHash),
+      fetchPlaybackSignals(accessToken, userHash),
+    ]);
+  } catch (e) {
+    // fetchTraktProfile/Playback 内部已经处理 isTrakt401 → traktAuthClear
+    // 这里只需透传, 用户下次刷新会重新进 device flow
+    throw e;
+  }
+
+  // 空数据守卫: 重度观众但没评分的用户也能跑通
   if (
     (profile.watchedItems || []).length === 0 &&
     (profile.recentTitles || []).length === 0
@@ -1145,6 +1588,7 @@ async function getRecommendations(params = {}) {
     throw new Error("Trakt 账号暂无观影数据, 请先在 Trakt 标记一些作品");
   }
 
+  // 3. TMDB 候选池
   const { candidates, candidateById } = await fetchTMDBCandidates(
     tmdbApiKey,
     profile,
@@ -1156,12 +1600,14 @@ async function getRecommendations(params = {}) {
     throw new Error("没有找到合适的候选作品");
   }
 
+  // 4. LLM 排序 (带 playbackSignals), 失败降级到 fallbackRank
   let ranked;
   try {
     ranked = await rankWithLLM(
       openaiApiKey,
       openaiCfg,
       profile,
+      playbackSignals,
       candidates,
       count,
       language
@@ -1180,8 +1626,7 @@ async function getRecommendations(params = {}) {
     ranked = fallbackRank(candidates, count);
   }
 
-  // 兜底: 即便 LLM 不听 prompt, 也绝不让心愿单上的作品出现在结果里.
-  // (候选池阶段已经排除过, 但 LLM 偶尔会把候选 id 张冠李戴)
+  // 5. watchlist 兜底过滤 — LLM 偶尔会忽略 prompt 把心愿单作品混进来
   const watchlistSet = new Set(profile.watchlistTmdbIds || []);
   if (watchlistSet.size > 0) {
     ranked = ranked.filter(
